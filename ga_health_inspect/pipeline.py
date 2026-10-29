@@ -12,9 +12,10 @@ def run(conn, source, run_id, options):
         fetched, remaining = fetch_page(conn, source, facilities, options['reports'], remaining, options['full'])
         ingest_page(conn, run_id, page, fetched)
         page += 1
-        if cutoff and all((date := transform.facility(f, [0])['last_inspection_date']) is not None
-                          and date < cutoff.isoformat() for f in facilities):
-            return 'caught_up'
+        if cutoff:
+            dates = [transform.facility(f, [0])['last_inspection_date'] for f in facilities]
+            if all(date is not None and date < cutoff.isoformat() for date in dates):
+                return 'caught_up'
     return 'bounded'
 
 
@@ -56,16 +57,18 @@ def ingest_page(conn, run_id, page, fetched):
              sum(item.get('skipped', False) for item in fetched), errors[0], report_errors, run_id))
 
 
-def fetch_page(conn, source, facilities, reports, remaining, full=False):
+def fetch_page(conn, source, facilities, reports, remaining, full):
     fetched = []
     for f in facilities:
         errors = [0]
         facility = transform.facility(f, errors)
         entries = []
-        stored = conn.execute('''SELECT raw, EXISTS (SELECT 1 FROM inspections
-            WHERE facility_id = facilities.source_id AND report_fields IS NULL)
-            FROM facilities WHERE source_id = %s''', (facility['source_id'],)).fetchone()
-        needs_reports = reports and (remaining is None or remaining > 0) and stored and stored[1]
+        stored = conn.execute('SELECT raw FROM facilities WHERE source_id = %s',
+                              (facility['source_id'],)).fetchone()
+        needs_reports = False
+        if not full and stored and stored[0] == f and reports and (remaining is None or remaining > 0):
+            needs_reports = conn.execute('''SELECT EXISTS (SELECT 1 FROM inspections
+                WHERE facility_id = %s AND report_fields IS NULL)''', (facility['source_id'],)).fetchone()[0]
         if not full and stored and stored[0] == f and not needs_reports:
             fetched.append({'facility': f, 'inspections': entries, 'skipped': True})
             continue
@@ -73,8 +76,8 @@ def fetch_page(conn, source, facilities, reports, remaining, full=False):
             entry = {'inspection': raw}
             i = transform.inspection(raw, facility['source_id'], [0])
             if reports and (remaining is None or remaining > 0):
-                stored = conn.execute('SELECT report_fields IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
-                if not (stored and stored[0]):
+                stored_report = conn.execute('SELECT report_fields IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
+                if not (stored_report and stored_report[0]):
                     if remaining is not None:
                         remaining -= 1
                     try:

@@ -18,7 +18,7 @@ def cutoff(conn, run_id, options):
     if options['start_page'] == 0 and not options['full']:
         row = conn.execute("""SELECT (started AT TIME ZONE 'America/New_York')::date - %s
             FROM etl_runs WHERE id <> %s AND status IN ('exhausted', 'caught_up')
-              AND options->>'start_page' = '0'
+              AND next_page > 0 AND options->>'start_page' = '0'
             ORDER BY started DESC, id DESC LIMIT 1""", (options['overlap_days'], run_id)).fetchone()
         value = row[0] if row else None
     conn.execute("UPDATE etl_runs SET options = jsonb_set(options, '{cutoff}', %s) WHERE id = %s",
