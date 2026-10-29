@@ -65,11 +65,12 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
         entries = []
         stored = conn.execute('SELECT raw FROM facilities WHERE source_id = %s',
                               (facility['source_id'],)).fetchone()
-        needs_reports = False
-        if not full and stored and stored[0] == f and reports and (remaining is None or remaining > 0):
-            needs_reports = conn.execute('''SELECT EXISTS (SELECT 1 FROM inspections
-                WHERE facility_id = %s AND report_fields IS NULL)''', (facility['source_id'],)).fetchone()[0]
-        if not full and stored and stored[0] == f and not needs_reports:
+        unchanged = not full and stored is not None and stored[0] == f
+        needs_reports = (unchanged and reports and (remaining is None or remaining > 0)
+                         and conn.execute('''SELECT EXISTS (SELECT 1 FROM inspections
+                             WHERE facility_id = %s AND report_fields IS NULL)''',
+                                          (facility['source_id'],)).fetchone()[0])
+        if unchanged and not needs_reports:
             fetched.append({'facility': f, 'inspections': entries, 'skipped': True})
             continue
         for raw in source.inspections(facility['source_id']):
