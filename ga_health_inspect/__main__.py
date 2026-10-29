@@ -15,8 +15,8 @@ def nonnegative(value):
 
 
 def positive(value):
-    value = nonnegative(value)
-    if value == 0:
+    value = int(value)
+    if value <= 0:
         raise argparse.ArgumentTypeError('must be positive')
     return value
 

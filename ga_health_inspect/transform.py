@@ -1,6 +1,5 @@
 import hashlib
 import json
-import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -51,7 +50,8 @@ def facility(raw, errors):
 
 
 def inspection(raw, facility_id, errors):
-    if not isinstance(raw, dict) or not isinstance(raw.get('inspectionId'), int) or isinstance(raw.get('inspectionId'), bool) or raw.get('facilityId') != facility_id:
+    if (not isinstance(raw, dict) or not isinstance(raw.get('inspectionId'), int)
+            or isinstance(raw.get('inspectionId'), bool) or raw.get('facilityId') != facility_id):
         raise ValueError('Invalid inspection id or facility')
     c = labels(raw.get('columns'))
     violations = raw.get('violations')
@@ -149,11 +149,13 @@ def tourist_report(page):
     return raw
 
 
+REPORT_EXTRACTORS = {'food_2015': food_report, 'pool_2017': pool_report, 'Tourist2014': tourist_report}
+
+
 def report(page, template, errors):
-    extractors = {'food_2015': food_report, 'pool_2017': pool_report, 'Tourist2014': tourist_report}
-    if template not in extractors:
+    if template not in REPORT_EXTRACTORS:
         raise ValueError('Unknown report template: ' + template)
-    raw = extractors[template](page)
+    raw = REPORT_EXTRACTORS[template](page)
     if not raw['name'] or not raw['inspection_date'] or raw['score'] is None:
         raise ValueError('Report header not recognized')
     fields = dict(raw)

@@ -15,9 +15,11 @@ class Source:
     def get(self, url):
         for attempt in range(3):
             time.sleep(max(0, 0.5 - (time.monotonic() - self.last_request)))
-            self.last_request = time.monotonic()
             try:
-                response = Fetcher.get(url, timeout=30, retries=1, follow_redirects=False)
+                try:
+                    response = Fetcher.get(url, timeout=30, retries=1, follow_redirects=False)
+                finally:
+                    self.last_request = time.monotonic()
                 if response.status >= 500:
                     raise RuntimeError(f'HTTP {response.status} for {url}')
                 if response.status != 200:

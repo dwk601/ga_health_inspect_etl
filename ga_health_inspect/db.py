@@ -20,7 +20,7 @@ def finish(conn, run_id, status, error=None):
 
 def upsert(conn, table, data, keys):
     columns = list(data)
-    vals = [Jsonb(v) if k == 'raw' and v is not None else v for k, v in data.items()]
+    vals = [Jsonb(v) if k == 'raw' else v for k, v in data.items()]
     updates = [f'{k}=EXCLUDED.{k}' for k in columns if k not in keys]
     if table == 'facilities':
         updates.append('last_seen_at=now()')

@@ -10,11 +10,7 @@ def ingest_page(conn, run_id, page, fetched):
             db.upsert(conn, 'facilities', f, ('source_id',))
             for entry in item['inspections']:
                 raw = entry['inspection']
-                if 'transformed' in entry:
-                    i, conversion_errors = entry['transformed']
-                    errors[0] += conversion_errors
-                else:
-                    i = transform.inspection(raw, f['source_id'], errors)
+                i = transform.inspection(raw, f['source_id'], errors)
                 db.upsert(conn, 'inspections', i, ('facility_id', 'source_id'))
                 count_inspections += 1
                 for key, value in raw['violations'].items():
@@ -49,24 +45,20 @@ def fetch_page(conn, source, facilities, reports, remaining):
         entries = []
         for raw in source.inspections(facility['source_id']):
             entry = {'inspection': raw}
+            i = transform.inspection(raw, facility['source_id'], [0])
             if reports and (remaining is None or remaining > 0):
-                inspection_errors = [0]
-                i = transform.inspection(raw, facility['source_id'], inspection_errors)
-                entry['transformed'] = (i, inspection_errors[0])
                 stored = conn.execute('SELECT report_fields IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
-            else:
-                stored = (True,)
-            if not (stored and stored[0]):
-                if remaining is not None:
-                    remaining -= 1
-                try:
-                    page = source.get(i['printable_url'])
-                    # Parse before ingest to make failures non-fatal to the page.
-                    report_conversions = [0]
-                    fields, raw_header = transform.report(page, i['report_template'], report_conversions)
-                    entry['report'] = (fields, raw_header, report_conversions[0])
-                except Exception as exc:
-                    entry['report'] = exc
+                if not (stored and stored[0]):
+                    if remaining is not None:
+                        remaining -= 1
+                    try:
+                        page = source.get(i['printable_url'])
+                        # Parse before ingest to make failures non-fatal to the page.
+                        report_conversions = [0]
+                        fields, raw_header = transform.report(page, i['report_template'], report_conversions)
+                        entry['report'] = (fields, raw_header, report_conversions[0])
+                    except Exception as exc:
+                        entry['report'] = exc
             entries.append(entry)
         fetched.append({'facility': f, 'inspections': entries})
     return fetched, remaining
