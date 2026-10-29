@@ -10,7 +10,7 @@ Scope is extraction, transformation, and loading—not a user-facing application
 - Source routes, pagination, record identifiers, and field semantics are unverified. Inspect the source before encoding assumptions about them.
 - PostgreSQL is the destination, not the source of truth for what the website exposes. Do not infer source deletions from an incomplete or failed extraction.
 - Destructive database operations (dropping, truncating, or replacing existing data) require explicit user authorization for the target database.
-- verify: TBD — add when a runnable ETL entry point and observable load contract exist. No verification runner is specified yet.
+- verify: set `POSTGRES_PASSWORD` and `COMPOSE_PROJECT_NAME` for a scratch Compose project, then run `docker compose up -d --wait postgres && docker compose run --rm etl --max-pages 2 --reports --max-reports 5`; expect a bounded run with next_page=2, 10 facilities and 5 parsed reports. Run `docker compose run --rm --entrypoint python etl -m unittest discover -s tests -v`; clean up the scratch project with `docker compose down -v --rmi local`.
 
 ## Standing rules
 

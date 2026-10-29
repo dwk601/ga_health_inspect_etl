@@ -1,0 +1,5 @@
+scrapling==0.5.0
+curl_cffi==0.17.0
+browserforge==1.2.4
+patchright==1.64.3
+psycopg[binary]==3.2.10
