@@ -14,18 +14,27 @@ def nonnegative(value):
     return value
 
 
+def positive(value):
+    value = nonnegative(value)
+    if value == 0:
+        raise argparse.ArgumentTypeError('must be positive')
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description='Load Georgia health inspections')
     parser.add_argument('--start-page', type=nonnegative, default=0)
     parser.add_argument('--max-pages', type=nonnegative)
     parser.add_argument('--reports', action='store_true')
-    parser.add_argument('--max-reports', type=nonnegative, default=0)
+    parser.add_argument('--max-reports', type=positive)
     args = parser.parse_args()
+    if args.max_reports is not None and not args.reports:
+        parser.error('--max-reports requires --reports')
     with psycopg.connect(autocommit=True) as conn:
         db.init(conn)
         run_id = db.start(conn, vars(args))
         page = args.start_page
-        remaining = args.max_reports or None
+        remaining = args.max_reports
         source = Source()
         try:
             while args.max_pages is None or page - args.start_page < args.max_pages:
@@ -45,6 +54,11 @@ def main():
             db.finish(conn, run_id, 'failed', str(exc))
             print(f'ETL failed: {exc}', file=sys.stderr)
             return 1
+        finally:
+            status, next_page, counters, conversions, report_errors = conn.execute(
+                'SELECT status, next_page, counters, conversion_errors, report_errors FROM etl_runs WHERE id=%s',
+                (run_id,)).fetchone()
+            print(f'status={status} next_page={next_page} counters={counters} conversion_errors={conversions} report_errors={report_errors}', flush=True)
 
 
 if __name__ == '__main__':

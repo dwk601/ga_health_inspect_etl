@@ -89,56 +89,83 @@ def violation(key, values, errors):
                 notes=fields.get('inspector notes'), raw=values)
 
 
-def report(page, template, errors):
-    if template not in ('food_2015', 'pool_2017', 'Tourist2014'):
-        raise ValueError('Unknown report template: ' + template)
-    def text(node):
-        return ' '.join(' '.join(node.xpath('.//text()').getall()).replace('\xa0', ' ').split())
-    def value(label):
-        # Labels are either in their own cell or followed by a span in the same cell.
-        nodes = page.xpath('//td[normalize-space(.) and (b or strong)] | //td[not(*)]')
-        for node in nodes:
-            s = text(node)
-            if s.startswith(label):
-                tail = s[len(label):].strip()
-                if tail:
-                    return tail
-                siblings = node.xpath('./following-sibling::td')
-                for sibling in siblings:
-                    candidate = text(sibling)
-                    if candidate:
-                        return candidate
-        return None
-    name_label = {'food_2015': 'Establishment Name:', 'pool_2017': 'Facility Name:', 'Tourist2014': 'Accommodation Name:'}[template]
-    raw = {k: value(label) for k, label in [('name', name_label), ('address', 'Facility Address:' if template == 'pool_2017' else 'Address:'), ('city', 'City:'), ('permit_number', 'Permit Number:' if template == 'pool_2017' else 'Permit#:'), ('inspection_date', 'Inspection Date:'), ('time_in', 'Time In:'), ('time_out', 'Time Out:')]}
-    if template == 'food_2015':
-        scores = page.css('#div_finalScore::text').getall()
-        grades = page.css('#div_grade::text').getall()
-    elif template == 'pool_2017':
-        scores = page.xpath('//td[contains(@class,"ArialEighteen") and @rowspan]/strong/text()').getall()
-        grades = []
-    else:
-        scores = page.xpath('//td[contains(@style,"font-size:40pt")]/text()').getall()
-        grades = []
-    if template == 'food_2015':
-        for key, label in [('time_in', 'Time In:'), ('time_out', 'Time Out:')]:
-            cells = page.xpath('//b[normalize-space(.)=$label]/parent::td/following-sibling::td[position() <= 4]', label=label)
-            parts = [text(cell) for cell in cells]
-            raw[key] = f'{parts[0]}:{parts[2]} {parts[3]}' if len(parts) == 4 and parts[1] == ':' and parts[0].isdigit() and parts[2].isdigit() and parts[3] in ('AM', 'PM') else None
+def text(node):
+    return ' '.join(' '.join(node.xpath('.//text()').getall()).replace('\xa0', ' ').split())
+
+
+def cell_value(page, label):
+    nodes = page.xpath('//td[normalize-space(.) and (b or strong)] | //td[not(*)]')
+    for node in nodes:
+        s = text(node)
+        if s.startswith(label):
+            tail = s[len(label):].strip()
+            if tail:
+                return tail
+            for sibling in node.xpath('./following-sibling::td'):
+                candidate = text(sibling)
+                if candidate:
+                    return candidate
+    return None
+
+
+def common_cells(page, name_label, address_label, permit_label):
+    return {key: cell_value(page, label) for key, label in [
+        ('name', name_label), ('address', address_label), ('city', 'City:'),
+        ('permit_number', permit_label), ('inspection_date', 'Inspection Date:')]}
+
+
+def food_report(page):
+    raw = common_cells(page, 'Establishment Name:', 'Address:', 'Permit#:')
+    for key, label in [('time_in', 'Time In:'), ('time_out', 'Time Out:')]:
+        cells = page.xpath('//b[normalize-space(.)=$label]/parent::td/following-sibling::td[position() <= 4]', label=label)
+        parts = [text(cell) for cell in cells]
+        raw[key] = (f'{parts[0]}:{parts[2]} {parts[3]}'.strip() if len(parts) == 4 and parts[1] == ':' and (parts[0] or parts[2] or parts[3]) else ' '.join(part for part in parts if part and part != ':') or None)
+    scores = page.css('#div_finalScore::text').getall()
+    grades = page.css('#div_grade::text').getall()
     raw['score'] = scores[0].strip() if scores else None
     raw['grade'] = grades[0].strip() if grades else None
-    # Tourist labels share cells; extract only through the following labelled field.
-    if template == 'Tourist2014':
-        for key, label in [('name', 'Accommodation Name:'), ('address', 'Address:'), ('city', 'City:'), ('permit_number', 'Permit#:'), ('inspection_date', 'Inspection Date:'), ('time_in', 'Time In:'), ('time_out', 'Time Out:')]:
-            nodes = page.xpath('//strong[normalize-space(.)=$label]/following-sibling::span[1]', label=label)
-            raw[key] = text(nodes[0]) if nodes else None
-            if nodes and key in ('time_in', 'time_out'):
-                suffix = nodes[0].xpath('./following-sibling::sup[1]/text()').get()
-                raw[key] = f'{raw[key]} {suffix.strip()}' if suffix and suffix.strip() in ('AM', 'PM') else None
+    return raw
+
+
+def pool_report(page):
+    raw = common_cells(page, 'Facility Name:', 'Facility Address:', 'Permit Number:')
+    raw.update(time_in=cell_value(page, 'Time In:'), time_out=cell_value(page, 'Time Out:'))
+    scores = page.xpath('//td[contains(@class,"ArialEighteen") and @rowspan]/strong/text()').getall()
+    raw.update(score=scores[0].strip() if scores else None, grade=None)
+    return raw
+
+
+def tourist_report(page):
+    raw = {}
+    for key, label in [('name', 'Accommodation Name:'), ('address', 'Address:'), ('city', 'City:'), ('permit_number', 'Permit#:'), ('inspection_date', 'Inspection Date:'), ('time_in', 'Time In:'), ('time_out', 'Time Out:')]:
+        nodes = page.xpath('//strong[normalize-space(.)=$label]/following-sibling::span[1]', label=label)
+        raw[key] = text(nodes[0]) if nodes else None
+        if nodes and key in ('time_in', 'time_out'):
+            suffix = nodes[0].xpath('./following-sibling::sup[1]/text()').get()
+            if suffix:
+                raw[key] = f'{raw[key]} {suffix.strip()}'.strip()
+    scores = page.xpath('//td[contains(@style,"font-size:40pt")]/text()').getall()
+    raw.update(score=scores[0].strip() if scores else None, grade=None)
+    return raw
+
+
+def report(page, template, errors):
+    extractors = {'food_2015': food_report, 'pool_2017': pool_report, 'Tourist2014': tourist_report}
+    if template not in extractors:
+        raise ValueError('Unknown report template: ' + template)
+    raw = extractors[template](page)
     if not raw['name'] or not raw['inspection_date'] or raw['score'] is None:
         raise ValueError('Report header not recognized')
     fields = dict(raw)
     fields['inspection_date'] = date(raw['inspection_date'], '%m/%d/%Y', errors)
     score = number(raw['score'], errors)
     fields['score'] = str(score) if score is not None else None
+    for key in ('time_in', 'time_out'):
+        value = raw[key]
+        fields[key] = None
+        if value and value.strip().upper() not in ('NA', 'N/A'):
+            try:
+                fields[key] = datetime.strptime(value.strip(), '%I:%M %p').strftime('%H:%M:%S')
+            except ValueError:
+                errors[0] += 1
     return fields, raw

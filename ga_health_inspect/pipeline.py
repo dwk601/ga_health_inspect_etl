@@ -3,14 +3,18 @@ from . import db, transform
 
 def ingest_page(conn, run_id, page, fetched):
     errors = [0]
-    count_inspections = count_violations = report_errors = 0
+    count_inspections = count_violations = count_reports = report_errors = 0
     with conn.transaction():
         for item in fetched:
             f = transform.facility(item['facility'], errors)
             db.upsert(conn, 'facilities', f, ('source_id',))
             for entry in item['inspections']:
                 raw = entry['inspection']
-                i = transform.inspection(raw, f['source_id'], errors)
+                if 'transformed' in entry:
+                    i, conversion_errors = entry['transformed']
+                    errors[0] += conversion_errors
+                else:
+                    i = transform.inspection(raw, f['source_id'], errors)
                 db.upsert(conn, 'inspections', i, ('facility_id', 'source_id'))
                 count_inspections += 1
                 for key, value in raw['violations'].items():
@@ -22,18 +26,19 @@ def ingest_page(conn, run_id, page, fetched):
                     result = entry['report']
                     if isinstance(result, Exception):
                         report_errors += 1
-                        conn.execute('UPDATE inspections SET report_error=%s WHERE facility_id=%s AND source_id=%s', (str(result), f['source_id'], i['source_id']))
+                        db.save_report_error(conn, f['source_id'], i['source_id'], result)
                     else:
                         fields, raw_header, report_conversions = result
                         errors[0] += report_conversions
-                        from psycopg.types.json import Jsonb
-                        conn.execute('UPDATE inspections SET report_fields=%s, report_raw=%s, report_fetched_at=now(), report_error=NULL WHERE facility_id=%s AND source_id=%s', (Jsonb(fields), Jsonb(raw_header), f['source_id'], i['source_id']))
+                        db.save_report(conn, f['source_id'], i['source_id'], fields, raw_header)
+                        count_reports += 1
         conn.execute("""UPDATE etl_runs SET next_page=%s,
             counters=jsonb_build_object('facilities',COALESCE((counters->>'facilities')::int,0)+%s,
               'inspections',COALESCE((counters->>'inspections')::int,0)+%s,
-              'violations',COALESCE((counters->>'violations')::int,0)+%s),
+              'violations',COALESCE((counters->>'violations')::int,0)+%s,
+              'parsed_reports',COALESCE((counters->>'parsed_reports')::int,0)+%s),
             conversion_errors=conversion_errors+%s, report_errors=report_errors+%s WHERE id=%s""",
-            (page + 1, len(fetched), count_inspections, count_violations, errors[0], report_errors, run_id))
+            (page + 1, len(fetched), count_inspections, count_violations, count_reports, errors[0], report_errors, run_id))
 
 
 def fetch_page(conn, source, facilities, reports, remaining):
@@ -43,10 +48,15 @@ def fetch_page(conn, source, facilities, reports, remaining):
         facility = transform.facility(f, errors)
         entries = []
         for raw in source.inspections(facility['source_id']):
-            i = transform.inspection(raw, facility['source_id'], errors)
             entry = {'inspection': raw}
-            stored = conn.execute('SELECT report_fields IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
-            if reports and (remaining is None or remaining > 0) and not (stored and stored[0]):
+            if reports and (remaining is None or remaining > 0):
+                inspection_errors = [0]
+                i = transform.inspection(raw, facility['source_id'], inspection_errors)
+                entry['transformed'] = (i, inspection_errors[0])
+                stored = conn.execute('SELECT report_fields IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
+            else:
+                stored = (True,)
+            if not (stored and stored[0]):
                 if remaining is not None:
                     remaining -= 1
                 try:
