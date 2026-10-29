@@ -7,4 +7,4 @@ COPY schema.sql .
 COPY tests ./tests
 USER etl
 ENTRYPOINT ["python", "-m", "ga_health_inspect"]
-CMD ["--max-pages", "2"]
+CMD []

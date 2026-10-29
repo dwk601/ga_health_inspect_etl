@@ -25,6 +25,8 @@ def main():
     parser = argparse.ArgumentParser(description='Load Georgia health inspections')
     parser.add_argument('--start-page', type=nonnegative, default=0)
     parser.add_argument('--max-pages', type=nonnegative)
+    parser.add_argument('--full', action='store_true')
+    parser.add_argument('--overlap-days', type=nonnegative, default=14)
     parser.add_argument('--reports', action='store_true')
     parser.add_argument('--max-reports', type=positive)
     args = parser.parse_args()
@@ -33,19 +35,9 @@ def main():
     with psycopg.connect(autocommit=True) as conn:
         db.init(conn)
         run_id = db.start(conn, vars(args))
-        page = args.start_page
-        remaining = args.max_reports
-        source = Source()
         try:
-            while args.max_pages is None or page - args.start_page < args.max_pages:
-                facilities = source.search(page)
-                if not facilities:
-                    db.finish(conn, run_id, 'exhausted')
-                    return 0
-                fetched, remaining = pipeline.fetch_page(conn, source, facilities, args.reports, remaining)
-                pipeline.ingest_page(conn, run_id, page, fetched)
-                page += 1
-            db.finish(conn, run_id, 'bounded')
+            status = pipeline.run(conn, Source(), run_id, vars(args))
+            db.finish(conn, run_id, status)
             return 0
         except KeyboardInterrupt:
             db.finish(conn, run_id, 'interrupted', 'Interrupted')
@@ -55,10 +47,10 @@ def main():
             print(f'ETL failed: {exc}', file=sys.stderr)
             return 1
         finally:
-            status, next_page, counters, conversions, report_errors = conn.execute(
-                'SELECT status, next_page, counters, conversion_errors, report_errors FROM etl_runs WHERE id=%s',
+            status, next_page, counters, conversions, report_errors, options = conn.execute(
+                'SELECT status, next_page, counters, conversion_errors, report_errors, options FROM etl_runs WHERE id=%s',
                 (run_id,)).fetchone()
-            print(f'status={status} next_page={next_page} counters={counters} conversion_errors={conversions} report_errors={report_errors}', flush=True)
+            print(f'status={status} next_page={next_page} cutoff={options.get("cutoff")} counters={counters} conversion_errors={conversions} report_errors={report_errors}', flush=True)
 
 
 if __name__ == '__main__':

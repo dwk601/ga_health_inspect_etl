@@ -13,6 +13,19 @@ def start(conn, options):
                             ('running', Jsonb(options), options['start_page'])).fetchone()[0]
 
 
+def cutoff(conn, run_id, options):
+    value = None
+    if options['start_page'] == 0 and not options['full']:
+        row = conn.execute("""SELECT (started AT TIME ZONE 'America/New_York')::date - %s
+            FROM etl_runs WHERE id <> %s AND status IN ('exhausted', 'caught_up')
+              AND options->>'start_page' = '0'
+            ORDER BY started DESC, id DESC LIMIT 1""", (options['overlap_days'], run_id)).fetchone()
+        value = row[0] if row else None
+    conn.execute("UPDATE etl_runs SET options = jsonb_set(options, '{cutoff}', %s) WHERE id = %s",
+                 (Jsonb(value.isoformat() if value else None), run_id))
+    return value
+
+
 def finish(conn, run_id, status, error=None):
     with conn.transaction():
         conn.execute('UPDATE etl_runs SET status=%s, finished=now(), error=%s WHERE id=%s', (status, error, run_id))

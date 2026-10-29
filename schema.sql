@@ -18,7 +18,20 @@ CREATE TABLE IF NOT EXISTS violations (
 );
 CREATE TABLE IF NOT EXISTS etl_runs (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, started timestamptz NOT NULL DEFAULT now(), finished timestamptz,
- status text NOT NULL CHECK (status IN ('running','bounded','exhausted','failed','interrupted')),
+ status text NOT NULL CHECK (status IN ('running','bounded','exhausted','caught_up','failed','interrupted')),
  options jsonb NOT NULL, next_page integer NOT NULL, counters jsonb NOT NULL DEFAULT '{}'::jsonb,
  conversion_errors integer NOT NULL DEFAULT 0, report_errors integer NOT NULL DEFAULT 0, error text
 );
+DO $$
+DECLARE constraint_name text;
+BEGIN
+ FOR constraint_name IN
+   SELECT conname FROM pg_constraint
+   WHERE conrelid = 'etl_runs'::regclass AND contype = 'c'
+     AND pg_get_constraintdef(oid) LIKE '%status%'
+     AND pg_get_constraintdef(oid) NOT LIKE '%caught_up%'
+ LOOP
+   EXECUTE format('ALTER TABLE etl_runs DROP CONSTRAINT %I', constraint_name);
+   EXECUTE format('ALTER TABLE etl_runs ADD CONSTRAINT %I CHECK (status IN (''running'', ''bounded'', ''exhausted'', ''caught_up'', ''failed'', ''interrupted''))', constraint_name);
+ END LOOP;
+END $$;

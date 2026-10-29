@@ -1,14 +1,85 @@
 import copy
 import unittest
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import psycopg
 from scrapling.parser import Selector
 
-from ga_health_inspect import db, transform
+from ga_health_inspect import db, pipeline, transform
 from ga_health_inspect.pipeline import ingest_page
+
+FACILITY = {'id': 'YWJj', 'name': 'Example', 'mapAddress': '1 Main St', 'columns': {
+    '0': '1 Main St', '1': 'Phone Number: 123', '2': 'Permit Type: Food Service',
+    '3': 'Permit Number: F-1', '4': 'Last Inspection Score: 90', '5': 'Last Inspection Date: 01-02-2024'}}
+INSPECTION = {'inspectionId': 42, 'facilityId': 'YWJj',
+    'printablePath': '../../_templates/87/food_2015/_report_full.cfm?fsimID=42&rtype=food_2015',
+    'columns': {'0': 'Date: 1-2-2024', '1': 'Inspection Purpose: Routine', '2': 'Score: 90', '3': 'Inspector: Person'},
+    'violations': {'0': ['1. Item', 'Rule', 'Points: 2', 'Corrected during inspection?: Yes', 'Repeat: No', 'Inspector Notes: Fix']}}
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_incremental_refresh(self):
+        class Rollback(Exception):
+            pass
+
+        today = datetime.now(ZoneInfo('America/New_York')).date()
+        facilities = []
+        for name, days in [('A', 0), ('B', 7), ('C', 20), ('D', 30)]:
+            f = copy.deepcopy(FACILITY)
+            f.update(id=name, name=name)
+            f['columns']['5'] = 'Last Inspection Date: ' + (today - timedelta(days=days)).strftime('%m-%d-%Y')
+            facilities.append(f)
+
+        class Source:
+            def __init__(self):
+                self.searches = []
+                self.requests = []
+
+            def search(self, page):
+                self.searches.append(page)
+                return [facilities[page]] if page < len(facilities) else []
+
+            def inspections(self, facility_id):
+                self.requests.append(facility_id)
+                inspection = copy.deepcopy(INSPECTION)
+                inspection['facilityId'] = facility_id
+                return [inspection]
+
+            def get(self, url):
+                raise AssertionError('reports are disabled')
+
+        options = dict(start_page=0, max_pages=1, full=False, overlap_days=14, reports=False, max_reports=None)
+        with psycopg.connect(autocommit=True) as conn:
+            try:
+                with conn.transaction():
+                    conn.execute('CREATE SCHEMA etl_incremental_test')
+                    conn.execute('SET LOCAL search_path TO etl_incremental_test')
+                    db.init(conn)
+                    def execute(source):
+                        run_id = db.start(conn, options)
+                        status = pipeline.run(conn, source, run_id, options)
+                        db.finish(conn, run_id, status)
+                        return run_id, status
+
+                    self.assertEqual(execute(Source())[1], 'bounded')
+                    options['max_pages'] = None
+                    source = Source()
+                    self.assertEqual(execute(source)[1], 'exhausted')
+                    self.assertEqual(source.searches, [0, 1, 2, 3, 4])
+                    facilities[0]['name'] = 'A updated'
+                    source = Source()
+                    run_id, status = execute(source)
+                    self.assertEqual(status, 'caught_up')
+                    self.assertEqual(source.searches, [0, 1, 2])
+                    self.assertEqual(source.requests, ['A'])
+                    self.assertEqual(conn.execute("SELECT next_page, (counters->>'skipped_facilities')::int, options->>'cutoff' FROM etl_runs WHERE id=%s", (run_id,)).fetchone(),
+                                     (3, 2, (today - timedelta(days=14)).isoformat()))
+                    self.assertEqual(conn.execute("SELECT source_id, name FROM facilities WHERE source_id IN ('A', 'D') ORDER BY source_id").fetchall(), [('A', 'A updated'), ('D', 'D')])
+                    raise Rollback()
+            except Rollback:
+                pass
+
     def test_ingestion_replay_and_invalid_page(self):
         class Rollback(Exception):
             pass
@@ -23,13 +94,8 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual((raw['time_in'], parsed['time_in'], parsed['time_out'], errors[0]),
                          ('bad:30 AM', None, '10:30:00', 1))
 
-        facility = {'id': 'YWJj', 'name': 'Example', 'mapAddress': '1 Main St', 'columns': {
-            '0': '1 Main St', '1': 'Phone Number: 123', '2': 'Permit Type: Food Service',
-            '3': 'Permit Number: F-1', '4': 'Last Inspection Score: 90', '5': 'Last Inspection Date: 01-02-2024'}}
-        inspection = {'inspectionId': 42, 'facilityId': 'YWJj',
-            'printablePath': '../../_templates/87/food_2015/_report_full.cfm?fsimID=42&rtype=food_2015',
-            'columns': {'0': 'Date: 1-2-2024', '1': 'Inspection Purpose: Routine', '2': 'Score: 90', '3': 'Inspector: Person'},
-            'violations': {'0': ['1. Item', 'Rule', 'Points: 2', 'Corrected during inspection?: Yes', 'Repeat: No', 'Inspector Notes: Fix']}}
+        facility = copy.deepcopy(FACILITY)
+        inspection = copy.deepcopy(INSPECTION)
         fields = parsed
         fetched = [{'facility': facility, 'inspections': [{'inspection': inspection, 'report': (fields, raw, errors[0])}]}]
         with psycopg.connect(autocommit=True) as conn:

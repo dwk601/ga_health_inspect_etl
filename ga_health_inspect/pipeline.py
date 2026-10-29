@@ -1,6 +1,23 @@
 from . import db, transform
 
 
+def run(conn, source, run_id, options):
+    cutoff = db.cutoff(conn, run_id, options)
+    page = options['start_page']
+    remaining = options['max_reports']
+    while options['max_pages'] is None or page - options['start_page'] < options['max_pages']:
+        facilities = source.search(page)
+        if not facilities:
+            return 'exhausted'
+        fetched, remaining = fetch_page(conn, source, facilities, options['reports'], remaining, options['full'])
+        ingest_page(conn, run_id, page, fetched)
+        page += 1
+        if cutoff and all((date := transform.facility(f, [0])['last_inspection_date']) is not None
+                          and date < cutoff.isoformat() for f in facilities):
+            return 'caught_up'
+    return 'bounded'
+
+
 def ingest_page(conn, run_id, page, fetched):
     errors = [0]
     count_inspections = count_violations = count_reports = report_errors = 0
@@ -32,17 +49,26 @@ def ingest_page(conn, run_id, page, fetched):
             counters=jsonb_build_object('facilities',COALESCE((counters->>'facilities')::int,0)+%s,
               'inspections',COALESCE((counters->>'inspections')::int,0)+%s,
               'violations',COALESCE((counters->>'violations')::int,0)+%s,
-              'parsed_reports',COALESCE((counters->>'parsed_reports')::int,0)+%s),
+              'parsed_reports',COALESCE((counters->>'parsed_reports')::int,0)+%s,
+              'skipped_facilities',COALESCE((counters->>'skipped_facilities')::int,0)+%s),
             conversion_errors=conversion_errors+%s, report_errors=report_errors+%s WHERE id=%s""",
-            (page + 1, len(fetched), count_inspections, count_violations, count_reports, errors[0], report_errors, run_id))
+            (page + 1, len(fetched), count_inspections, count_violations, count_reports,
+             sum(item.get('skipped', False) for item in fetched), errors[0], report_errors, run_id))
 
 
-def fetch_page(conn, source, facilities, reports, remaining):
+def fetch_page(conn, source, facilities, reports, remaining, full=False):
     fetched = []
     for f in facilities:
         errors = [0]
         facility = transform.facility(f, errors)
         entries = []
+        stored = conn.execute('''SELECT raw, EXISTS (SELECT 1 FROM inspections
+            WHERE facility_id = facilities.source_id AND report_fields IS NULL)
+            FROM facilities WHERE source_id = %s''', (facility['source_id'],)).fetchone()
+        needs_reports = reports and (remaining is None or remaining > 0) and stored and stored[1]
+        if not full and stored and stored[0] == f and not needs_reports:
+            fetched.append({'facility': f, 'inspections': entries, 'skipped': True})
+            continue
         for raw in source.inspections(facility['source_id']):
             entry = {'inspection': raw}
             i = transform.inspection(raw, facility['source_id'], [0])
