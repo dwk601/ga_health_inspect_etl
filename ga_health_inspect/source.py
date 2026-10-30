@@ -2,7 +2,7 @@ import json
 import time
 from urllib.parse import quote, urljoin, urlsplit, parse_qs
 
-from scrapling.fetchers import Fetcher
+from scrapling.fetchers import FetcherSession
 
 BASE = 'https://ga.healthinspections.us/stateofgeorgia/'
 API = BASE + 'API/index.cfm/'
@@ -11,13 +11,21 @@ API = BASE + 'API/index.cfm/'
 class Source:
     def __init__(self):
         self.last_request = 0.0
+        self.session_manager = FetcherSession()
+
+    def __enter__(self):
+        self.session = self.session_manager.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.session_manager.__exit__(exc_type, exc_value, traceback)
 
     def get(self, url):
         for attempt in range(3):
             time.sleep(max(0, 0.5 - (time.monotonic() - self.last_request)))
             try:
                 try:
-                    response = Fetcher.get(url, timeout=30, retries=1, follow_redirects=False)
+                    response = self.session.get(url, timeout=30, retries=1, follow_redirects=False, discard_cookies=True)
                 finally:
                     self.last_request = time.monotonic()
                 if response.status >= 500:

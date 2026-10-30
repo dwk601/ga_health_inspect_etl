@@ -60,8 +60,7 @@ def ingest_page(conn, run_id, page, fetched):
 def fetch_page(conn, source, facilities, reports, remaining, full):
     fetched = []
     for f in facilities:
-        errors = [0]
-        facility = transform.facility(f, errors)
+        facility = transform.facility(f, [0])
         entries = []
         stored = conn.execute('SELECT raw FROM facilities WHERE source_id = %s',
                               (facility['source_id'],)).fetchone()

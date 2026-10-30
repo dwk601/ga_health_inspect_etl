@@ -36,7 +36,8 @@ def main():
         db.init(conn)
         run_id = db.start(conn, vars(args))
         try:
-            status = pipeline.run(conn, Source(), run_id, vars(args))
+            with Source() as source:
+                status = pipeline.run(conn, source, run_id, vars(args))
             db.finish(conn, run_id, status)
             return 0
         except KeyboardInterrupt:
