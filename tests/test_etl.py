@@ -1,6 +1,9 @@
 import copy
+import json
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -8,6 +11,7 @@ from scrapling.parser import Selector
 
 from ga_health_inspect import db, pipeline, transform
 from ga_health_inspect.pipeline import ingest_page
+from ga_health_inspect.source import Source
 
 FACILITY = {'id': 'YWJj', 'name': 'Example', 'mapAddress': '1 Main St', 'columns': {
     '0': '1 Main St', '1': 'Phone Number: 123', '2': 'Permit Type: Food Service',
@@ -16,6 +20,28 @@ INSPECTION = {'inspectionId': 42, 'facilityId': 'YWJj',
     'printablePath': '../../_templates/87/food_2015/_report_full.cfm?fsimID=42&rtype=food_2015',
     'columns': {'0': 'Date: 1-2-2024', '1': 'Inspection Purpose: Routine', '2': 'Score: 90', '3': 'Inspector: Person'},
     'violations': {'0': ['1. Item', 'Rule', 'Points: 2', 'Corrected during inspection?: Yes', 'Repeat: No', 'Inspector Notes: Fix']}}
+
+
+class SourceTest(unittest.TestCase):
+    def test_search_only_ends_on_persistently_empty_page(self):
+        for bodies, expected in [([b'[]', b'[{"id": "A"}]'], [{'id': 'A'}]), ([b'[]'] * 4, [])]:
+            responses = iter(bodies)
+            source = Source()
+            source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(status=200, body=next(responses)))
+            with mock.patch('ga_health_inspect.source.time.sleep'):
+                self.assertEqual(source.search(1525), expected)
+
+    def test_inspections_normalize_source_quirks(self):
+        placeholder = {'printablePath': '', 'inspectionId': 0, 'facilityId': 'YWJj',
+                       'columns': {'0': 'No Inspections To Display'}, 'violations': {}}
+        other_facility = dict(INSPECTION, facilityId='other')
+        for bodies in [[[placeholder, INSPECTION]], [[other_facility], [INSPECTION]]]:
+            responses = iter(bodies)
+            source = Source()
+            source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(
+                status=200, body=json.dumps(next(responses)).encode()))
+            with mock.patch('ga_health_inspect.source.time.sleep'), mock.patch('sys.stderr'):
+                self.assertEqual(source.inspections('YWJj'), [INSPECTION])
 
 
 class LifecycleTest(unittest.TestCase):

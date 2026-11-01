@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from .source import report_url
+from .source import belongs_to, report_url
 
 
 def labels(columns):
@@ -50,9 +50,9 @@ def facility(raw, errors):
 
 
 def inspection(raw, facility_id, errors):
-    if (not isinstance(raw, dict) or not isinstance(raw.get('inspectionId'), int)
-            or isinstance(raw.get('inspectionId'), bool) or raw.get('facilityId') != facility_id):
-        raise ValueError('Invalid inspection id or facility')
+    if not belongs_to(raw, facility_id):
+        found = {k: raw.get(k) for k in ('inspectionId', 'facilityId')} if isinstance(raw, dict) else type(raw).__name__
+        raise ValueError(f'Invalid inspection id or facility for {facility_id}: {found}')
     c = labels(raw.get('columns'))
     violations = raw.get('violations')
     if not isinstance(violations, dict) or any(not isinstance(k, str) or not isinstance(v, list) or len(v) < 2 for k, v in violations.items()):
