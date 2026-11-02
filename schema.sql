@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS facilities (
  permit_number text, last_inspection_date date, last_inspection_score numeric,
  raw jsonb NOT NULL, first_seen_at timestamptz NOT NULL DEFAULT now(), last_seen_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE facilities ADD COLUMN IF NOT EXISTS google_places text;
 CREATE TABLE IF NOT EXISTS inspections (
  facility_id text NOT NULL REFERENCES facilities(source_id), source_id bigint NOT NULL,
  report_template text NOT NULL, inspection_date date, purpose text, score numeric, inspector text,
