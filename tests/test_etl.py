@@ -31,6 +31,17 @@ class SourceTest(unittest.TestCase):
             with mock.patch('ga_health_inspect.source.time.sleep'):
                 self.assertEqual(source.search(1525), expected)
 
+    def test_report_survives_unclosed_login_redirect_script(self):
+        body = b'''<html><body><table><tr><td><b>Establishment Name:</b> Example</td></tr>
+            <tr><td><b>Inspection Date:</b> 01/30/2026</td></tr></table>
+            <div><script>document.location.href="login.cfm?attempt=</div>
+            <div id="div_finalScore">100</div><div id="div_grade">A</div>
+            <script type="text/javascript">var x = 1;</script></body></html>'''
+        source = Source()
+        source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(status=200, body=body, encoding='utf-8'))
+        fields, raw = transform.report(source.report('https://example.test/r'), 'food_2015', [0])
+        self.assertEqual((fields['score'], fields['grade']), ('100', 'A'))
+
     def test_inspections_normalize_source_quirks(self):
         placeholder = {'printablePath': '', 'inspectionId': 0, 'facilityId': 'YWJj',
                        'columns': {'0': 'No Inspections To Display'}, 'violations': {}}
@@ -72,7 +83,7 @@ class LifecycleTest(unittest.TestCase):
                 inspection['facilityId'] = facility_id
                 return [inspection]
 
-            def get(self, url):
+            def report(self, url):
                 raise AssertionError('reports are disabled')
 
         options = dict(start_page=0, max_pages=1, full=False, overlap_days=14, reports=False, max_reports=None)

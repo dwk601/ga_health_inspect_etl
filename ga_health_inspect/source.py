@@ -1,9 +1,11 @@
 import json
+import re
 import sys
 import time
 from urllib.parse import quote, urljoin, urlsplit, parse_qs
 
 from scrapling.fetchers import FetcherSession
+from scrapling.parser import Selector
 
 BASE = 'https://ga.healthinspections.us/stateofgeorgia/'
 API = BASE + 'API/index.cfm/'
@@ -11,6 +13,8 @@ API = BASE + 'API/index.cfm/'
 EMPTY_PAGE_RECHECK_DELAYS = (10, 60, 300)
 # The inspections API intermittently returns records that don't belong to the requested facility; refetch.
 INSPECTIONS_REFETCH_DELAYS = (5, 30)
+# Some reports embed an unclosed `<script>` login redirect that would swallow the rest of the page when parsed.
+UNCLOSED_SCRIPT = re.compile(rb'<script>(?=[^<]*</div>)')
 
 
 class Source:
@@ -65,6 +69,10 @@ class Source:
                   file=sys.stderr, flush=True)
             time.sleep(delay)
         return self.facility_inspections(url)
+
+    def report(self, url):
+        response = self.get(url)
+        return Selector(UNCLOSED_SCRIPT.sub(b'', response.body), url=url, encoding=response.encoding)
 
     def facility_inspections(self, url):
         # Facilities without inspections get a placeholder row instead of an empty list.

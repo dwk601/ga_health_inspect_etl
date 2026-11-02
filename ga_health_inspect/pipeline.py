@@ -81,7 +81,7 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
                     if remaining is not None:
                         remaining -= 1
                     try:
-                        page = source.get(i['printable_url'])
+                        page = source.report(i['printable_url'])
                         # Parse before ingest to make failures non-fatal to the page.
                         report_conversions = [0]
                         fields, raw_header = transform.report(page, i['report_template'], report_conversions)
