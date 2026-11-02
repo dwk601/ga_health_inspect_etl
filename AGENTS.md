@@ -10,7 +10,16 @@ Scope is extraction, transformation, and loading—not a user-facing application
 - Source routes, pagination, record identifiers, and field semantics are unverified. Inspect the source before encoding assumptions about them.
 - PostgreSQL is the destination, not the source of truth for what the website exposes. Do not infer source deletions from an incomplete or failed extraction.
 - Destructive database operations (dropping, truncating, or replacing existing data) require explicit user authorization for the target database.
-- verify: set `POSTGRES_PASSWORD` and `COMPOSE_PROJECT_NAME` for a scratch Compose project, then run `docker compose up -d --wait && docker compose exec etl python -m ga_health_inspect --max-pages 2 --reports --max-reports 5`; expect a summary with status=bounded, next_page=2, 10 facilities and 5 parsed_reports. Run `docker compose exec etl python -m unittest discover -s tests -v`; clean up the scratch project with `docker compose down -v --rmi local`.
+- The local volume `ga_health_inspect_data` (default Compose project) holds a stopped copy of the data. Never run `docker compose` here without an explicit scratch `-p`, and don't rely on env vars or traps persisting across shell calls.
+- `schema.sql` runs on every start against existing databases: changes must be additive and idempotent (`ADD COLUMN IF NOT EXISTS`, `CREATE OR REPLACE VIEW`); no new `etl_runs` statuses.
+- verify: with an unused scratch name, run `POSTGRES_PASSWORD=scratch-only docker compose -p ga-check-<name> up -d --build --wait`, then `... -p ga-check-<name> exec -T etl python -m ga_health_inspect --max-pages 2 --reports --max-reports 5`; expect a one-line summary with status=bounded, next_page=2, 10 facilities and 5 parsed_reports. Run `... -p ga-check-<name> exec -T etl python -m unittest discover -s tests -v`; clean up with `... -p ga-check-<name> down -v --rmi local` and confirm `ga_health_inspect_data` still exists.
+
+## Deployment
+
+- Coolify app `ga-health-inspect-etl` (uuid `iejqjmufmnpmpyswfznrgzr2`) on `root@100.92.189.13` runs this compose file; Postgres is inside it, not a Coolify database resource, so Coolify backups don't cover it.
+- Scheduled task `daily-etl` runs in the idle `etl` container at `0 8 * * *` UTC: `timeout -s INT -k 120 35000 python -m ga_health_inspect --reports` (Coolify task timeout 36000s must stay above it). A full pass from page 0 takes about 1.5h.
+- Host systemd timer `ga-health-backup.timer` (07:15 UTC) runs `/usr/local/sbin/ga-health-backup`: `pg_dump -Fc` to `/var/backups/ga-health-inspect/health-*.dump`, kept 7 days, on the same host. Restoring a dump is preferred over a re-crawl.
+- After deploying a parser fix, run `python -m ga_health_inspect --retry-report-errors` once; stored report errors are otherwise never re-fetched.
 
 ## Standing rules
 

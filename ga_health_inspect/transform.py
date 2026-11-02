@@ -6,6 +6,13 @@ from decimal import Decimal, InvalidOperation
 from .source import belongs_to, report_url
 
 
+CONVERSION_VALUE_LIMIT = 200
+
+
+def conversion_error(errors, field, value, reason):
+    errors.append((field, str(value)[:CONVERSION_VALUE_LIMIT], reason))
+
+
 def labels(columns):
     if not isinstance(columns, dict) or not all(isinstance(v, str) for v in columns.values()):
         raise ValueError('Invalid columns')
@@ -13,7 +20,7 @@ def labels(columns):
             for v in columns.values() if ':' in v}
 
 
-def date(value, fmt, errors):
+def date(value, fmt, errors, field):
     if not value or value.strip().upper() == 'NA':
         return None
     try:
@@ -22,11 +29,11 @@ def date(value, fmt, errors):
             raise ValueError('noncanonical date')
         return parsed.date().isoformat()
     except (ValueError, TypeError):
-        errors[0] += 1
+        conversion_error(errors, field, value, 'invalid date')
         return None
 
 
-def number(value, errors):
+def number(value, errors, field):
     if value is None or str(value).strip().upper() in ('', 'NA', 'N/A'):
         return None
     try:
@@ -35,7 +42,7 @@ def number(value, errors):
             raise InvalidOperation
         return n
     except InvalidOperation:
-        errors[0] += 1
+        conversion_error(errors, field, value, 'invalid number')
         return None
 
 
@@ -45,8 +52,8 @@ def facility(raw, errors):
     c = labels(raw.get('columns'))
     return dict(source_id=raw['id'], name=raw.get('name'), address=raw.get('mapAddress'),
                 phone=c.get('phone number'), permit_type=c.get('permit type'), permit_number=c.get('permit number'),
-                last_inspection_date=date(c.get('last inspection date'), '%m-%d-%Y', errors),
-                last_inspection_score=number(c.get('last inspection score'), errors), raw=raw)
+                last_inspection_date=date(c.get('last inspection date'), '%m-%d-%Y', errors, 'last_inspection_date'),
+                last_inspection_score=number(c.get('last inspection score'), errors, 'last_inspection_score'), raw=raw)
 
 
 def inspection(raw, facility_id, errors):
@@ -60,8 +67,8 @@ def inspection(raw, facility_id, errors):
     url, template = report_url(raw.get('printablePath'))
     digest = hashlib.sha256(json.dumps(violations, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
     return dict(facility_id=facility_id, source_id=raw['inspectionId'], report_template=template,
-                inspection_date=date(c.get('date'), '%m-%d-%Y', errors), purpose=c.get('inspection purpose'),
-                score=number(c.get('score'), errors), inspector=c.get('inspector'), printable_url=url,
+                inspection_date=date(c.get('date'), '%m-%d-%Y', errors, 'inspection_date'), purpose=c.get('inspection purpose'),
+                score=number(c.get('score'), errors, 'score'), inspector=c.get('inspector'), printable_url=url,
                 raw=raw, violations_hash=digest)
 
 
@@ -77,15 +84,15 @@ def violation(key, values, errors):
         elif ':' in v:
             k, val = v.split(':', 1)
             fields[k.lower().strip()] = val.strip()
-    def boolean(value):
+    def boolean(value, field):
         if not value:
             return None
         if value.lower() in ('yes', 'no'):
             return value.lower() == 'yes'
-        errors[0] += 1
+        conversion_error(errors, field, value, 'invalid boolean')
         return None
-    return dict(source_key=key, code_title=values[0], regulation=values[1], points=number(fields.get('points'), errors),
-                corrected=boolean(fields.get('corrected during inspection?')), repeat=boolean(fields.get('repeat')),
+    return dict(source_key=key, code_title=values[0], regulation=values[1], points=number(fields.get('points'), errors, 'points'),
+                corrected=boolean(fields.get('corrected during inspection?'), 'corrected'), repeat=boolean(fields.get('repeat'), 'repeat'),
                 notes=fields.get('inspector notes'), raw=values)
 
 
@@ -124,14 +131,20 @@ def food_report(page):
     grades = page.css('#div_grade::text').getall()
     raw['score'] = scores[0].strip() if scores else None
     raw['grade'] = grades[0].strip() if grades else None
+    if raw['score'] is None:
+        raise ValueError('Report score not recognized')
     return raw
 
 
 def pool_report(page):
     raw = common_cells(page, 'Facility Name:', 'Facility Address:', 'Permit Number:')
     raw.update(time_in=cell_value(page, 'Time In:'), time_out=cell_value(page, 'Time Out:'))
-    scores = page.xpath('//td[contains(@class,"ArialEighteen") and @rowspan]/strong/text()').getall()
-    raw.update(score=scores[0].strip() if scores else None, grade=None)
+    containers = page.xpath('//td[contains(@class,"ArialEighteen") and @rowspan]/strong')
+    if not containers:
+        raise ValueError('Report score container not recognized')
+    scores = containers[0].xpath('./text()').getall()
+    score = scores[0].strip() if scores else ''
+    raw.update(score=score or None, grade=None)
     return raw
 
 
@@ -146,21 +159,39 @@ def tourist_report(page):
                 raw[key] = f'{raw[key]} {suffix.strip()}'.strip()
     scores = page.xpath('//td[contains(@style,"font-size:40pt")]/text()').getall()
     raw.update(score=scores[0].strip() if scores else None, grade=None)
+    if raw['score'] is None:
+        raise ValueError('Report score not recognized')
     return raw
 
 
-REPORT_EXTRACTORS = {'food_2015': food_report, 'pool_2017': pool_report, 'Tourist2014': tourist_report}
+def legacy_pool_report(page):
+    raw = {}
+    for key, label in [('name', 'Name of Facility'), ('address', 'Address'), ('city', 'City'),
+                       ('permit_number', 'Permit No.'), ('inspection_date', 'Date of Inspection')]:
+        cells = page.xpath('//tr/*[self::td or self::th][normalize-space(translate(., "\u00a0", " "))=$label]', label=label)
+        raw[key] = None
+        if cells:
+            index = len(cells[0].xpath('./preceding-sibling::*[self::td or self::th]'))
+            values = cells[0].xpath('../following-sibling::tr[1]/*[self::td or self::th]')
+            if index < len(values):
+                raw[key] = text(values[index]) or None
+    raw.update(score=None, grade=None, time_in=None, time_out=None)
+    return raw
+
+
+REPORT_EXTRACTORS = {'food_2015': food_report, 'pool_2017': pool_report,
+                     'Pool': legacy_pool_report, 'Tourist2014': tourist_report}
 
 
 def report(page, template, errors):
     if template not in REPORT_EXTRACTORS:
         raise ValueError('Unknown report template: ' + template)
     raw = REPORT_EXTRACTORS[template](page)
-    if not raw['name'] or not raw['inspection_date'] or raw['score'] is None:
+    if not raw['name'] or not raw['inspection_date']:
         raise ValueError('Report header not recognized')
     fields = dict(raw)
-    fields['inspection_date'] = date(raw['inspection_date'], '%m/%d/%Y', errors)
-    score = number(raw['score'], errors)
+    fields['inspection_date'] = date(raw['inspection_date'], '%m/%d/%Y', errors, 'inspection_date')
+    score = number(raw['score'], errors, 'score')
     fields['score'] = str(score) if score is not None else None
     for key in ('time_in', 'time_out'):
         value = raw[key]
@@ -169,5 +200,5 @@ def report(page, template, errors):
             try:
                 fields[key] = datetime.strptime(value.strip(), '%I:%M %p').strftime('%H:%M:%S')
             except ValueError:
-                errors[0] += 1
+                conversion_error(errors, key, value, 'invalid time')
     return fields, raw

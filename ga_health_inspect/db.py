@@ -2,6 +2,18 @@ from pathlib import Path
 from psycopg.types.json import Jsonb
 
 
+RUN_LOCK_KEY = 0x47414845414C5448
+REPORT_ERROR_BACKLOG = 'report_fields IS NULL AND (report_error IS NOT NULL OR report_fetched_at IS NOT NULL)'
+
+
+def try_run_lock(conn):
+    return conn.execute('SELECT pg_try_advisory_lock(%s)', (RUN_LOCK_KEY,)).fetchone()[0]
+
+
+def reconcile_runs(conn):
+    conn.execute("UPDATE etl_runs SET status='interrupted', finished=now(), error='Process ended without finishing' WHERE status='running'")
+
+
 def init(conn):
     with conn.transaction():
         conn.execute((Path(__file__).parent.parent / 'schema.sql').read_text())
@@ -47,5 +59,5 @@ def save_report(conn, facility_id, inspection_id, fields, raw):
 
 
 def save_report_error(conn, facility_id, inspection_id, exc):
-    conn.execute('UPDATE inspections SET report_error=%s WHERE facility_id=%s AND source_id=%s',
+    conn.execute('UPDATE inspections SET report_error=%s, report_fetched_at=now() WHERE facility_id=%s AND source_id=%s',
                  (f'{type(exc).__name__}: {exc}', facility_id, inspection_id))
