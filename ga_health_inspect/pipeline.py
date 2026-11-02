@@ -6,6 +6,7 @@ from . import db, transform
 
 
 MIN_EXHAUSTED_PAGE_RATIO = 0.9
+CONVERSION_SAMPLE_LIMIT = 20
 
 
 def run(conn, source, run_id, options):
@@ -72,26 +73,33 @@ def save_report_result(conn, facility_id, inspection_id, result):
     return 1, 0, conversions
 
 
-def update_report_counters(conn, run_id, parsed, failures, conversions):
+def update_report_counters(conn, run_id, parsed, failures, conversion_count):
     conn.execute('''UPDATE etl_runs SET report_errors=report_errors+%s,
         conversion_errors=conversion_errors+%s,
         counters=jsonb_set(counters, '{parsed_reports}',
         to_jsonb(COALESCE((counters->>'parsed_reports')::int,0)+%s), true) WHERE id=%s''',
-                 (failures, conversions, parsed, run_id))
+                 (failures, conversion_count, parsed, run_id))
 
 
 def record_conversions(conn, run_id, errors):
-    samples = conn.execute("SELECT COALESCE(options->'conversion_samples', '[]'::jsonb) FROM etl_runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()[0]
-    for error in errors[:max(0, 20 - len(samples))]:
+    if not errors:
+        return
+    samples = conn.execute("SELECT COALESCE(options->'conversion_samples', '[]'::jsonb) FROM etl_runs WHERE id=%s", (run_id,)).fetchone()[0]
+    new_samples = errors[:max(0, CONVERSION_SAMPLE_LIMIT - len(samples))]
+    if not new_samples:
+        return
+    for error in new_samples:
         samples.append(error)
         print(f'Conversion error: {error}', file=sys.stderr, flush=True)
     conn.execute("UPDATE etl_runs SET options=jsonb_set(options, '{conversion_samples}', %s) WHERE id=%s", (Jsonb(samples), run_id))
 
 
-def contextualize(errors, facility_id, entity, inspection_id=None):
+def contextualize(errors, facility_id, entity, inspection_id=None, violation_key=None):
     context = {'facility_id': facility_id, 'entity': entity}
     if inspection_id is not None:
         context['inspection_id'] = inspection_id
+    if violation_key is not None:
+        context['violation_key'] = violation_key
     return [dict(context, field=field, value=value, reason=reason) for field, value, reason in errors]
 
 
@@ -177,7 +185,7 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
                 for key, value in raw['violations'].items():
                     conversions = []
                     violations.append(transform.violation(key, value, conversions))
-                    inspection_errors.extend(contextualize(conversions, facility['source_id'], key, inspection['source_id']))
+                    inspection_errors.extend(contextualize(conversions, facility['source_id'], 'violation', inspection['source_id'], key))
                 entries.append({'inspection': inspection, 'violations': violations, 'conversion_errors': inspection_errors})
         except ValueError as exc:
             print(f"Invalid facility {facility['source_id']}: {exc}", file=sys.stderr, flush=True)

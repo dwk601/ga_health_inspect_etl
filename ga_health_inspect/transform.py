@@ -6,6 +6,13 @@ from decimal import Decimal, InvalidOperation
 from .source import belongs_to, report_url
 
 
+CONVERSION_VALUE_LIMIT = 200
+
+
+def conversion_error(errors, field, value, reason):
+    errors.append((field, str(value)[:CONVERSION_VALUE_LIMIT], reason))
+
+
 def labels(columns):
     if not isinstance(columns, dict) or not all(isinstance(v, str) for v in columns.values()):
         raise ValueError('Invalid columns')
@@ -22,7 +29,7 @@ def date(value, fmt, errors, field):
             raise ValueError('noncanonical date')
         return parsed.date().isoformat()
     except (ValueError, TypeError):
-        errors.append((field, str(value)[:200], 'invalid date'))
+        conversion_error(errors, field, value, 'invalid date')
         return None
 
 
@@ -35,7 +42,7 @@ def number(value, errors, field):
             raise InvalidOperation
         return n
     except InvalidOperation:
-        errors.append((field, str(value)[:200], 'invalid number'))
+        conversion_error(errors, field, value, 'invalid number')
         return None
 
 
@@ -82,7 +89,7 @@ def violation(key, values, errors):
             return None
         if value.lower() in ('yes', 'no'):
             return value.lower() == 'yes'
-        errors.append((field, str(value)[:200], 'invalid boolean'))
+        conversion_error(errors, field, value, 'invalid boolean')
         return None
     return dict(source_key=key, code_title=values[0], regulation=values[1], points=number(fields.get('points'), errors, 'points'),
                 corrected=boolean(fields.get('corrected during inspection?'), 'corrected'), repeat=boolean(fields.get('repeat'), 'repeat'),
@@ -193,5 +200,5 @@ def report(page, template, errors):
             try:
                 fields[key] = datetime.strptime(value.strip(), '%I:%M %p').strftime('%H:%M:%S')
             except ValueError:
-                errors.append((key, str(value)[:200], 'invalid time'))
+                conversion_error(errors, key, value, 'invalid time')
     return fields, raw

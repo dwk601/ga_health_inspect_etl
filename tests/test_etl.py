@@ -103,7 +103,8 @@ class SourceTest(unittest.TestCase):
 
 
 class LifecycleTest(unittest.TestCase):
-    def test_incremental_refresh(self):
+    @mock.patch('sys.stderr')
+    def test_incremental_refresh(self, stderr):
         class Rollback(Exception):
             pass
 
@@ -282,7 +283,8 @@ class LifecycleTest(unittest.TestCase):
             except Rollback:
                 pass
 
-    def test_ingestion_replay_and_invalid_page(self):
+    @mock.patch('sys.stderr')
+    def test_ingestion_replay_and_invalid_page(self, stderr):
         class Rollback(Exception):
             pass
 
@@ -337,6 +339,13 @@ class LifecycleTest(unittest.TestCase):
                     replay[0]['inspections'][0]['report'] = (fields, raw, errors)
                     ingest_page(conn, run, 0, replay, 0)
                     self.assertIsNone(conn.execute('SELECT report_error FROM inspections').fetchone()[0])
+                    inspection['violations'] = {str(i): ['Item', 'Rule', 'Points: bad'] for i in range(25)}
+                    capped_run = db.start(conn, {'start_page': 0})
+                    capped, _, _ = fetch_page(conn, source, [facility], False, None, True)
+                    ingest_page(conn, capped_run, 0, capped, 0)
+                    samples, count = conn.execute("SELECT options->'conversion_samples', conversion_errors FROM etl_runs WHERE id=%s", (capped_run,)).fetchone()
+                    self.assertEqual((len(samples), count), (20, 26))
+                    self.assertEqual(samples[1], {'facility_id': 'YWJj', 'inspection_id': 42, 'entity': 'violation', 'violation_key': '0', 'field': 'points', 'value': 'bad', 'reason': 'invalid number'})
                     raise Rollback()
             except Rollback:
                 pass
