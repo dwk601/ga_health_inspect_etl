@@ -1,7 +1,11 @@
+import sys
+
 from . import db, transform
 
 
 def run(conn, source, run_id, options):
+    if options.get('retry_report_errors'):
+        return retry_report_errors(conn, source, run_id, options['max_reports'])
     cutoff = db.cutoff(conn, run_id, options)
     page = options['start_page']
     remaining = options['max_reports']
@@ -16,6 +20,40 @@ def run(conn, source, run_id, options):
             dates = [transform.facility(f, [0])['last_inspection_date'] for f in facilities]
             if all(date is not None and date < cutoff.isoformat() for date in dates):
                 return 'caught_up'
+    return 'bounded'
+
+
+def fetch_report(source, url, template):
+    try:
+        page = source.report(url)
+    except Exception as exc:
+        print(f'Report fetch failed for {url}: {exc}', file=sys.stderr, flush=True)
+        return None
+    try:
+        conversions = [0]
+        fields, raw = transform.report(page, template, conversions)
+        return fields, raw, conversions[0]
+    except Exception as exc:
+        return exc
+
+
+def retry_report_errors(conn, source, run_id, limit):
+    rows = conn.execute('''SELECT facility_id, source_id, printable_url, report_template
+        FROM inspections WHERE report_error IS NOT NULL
+        ORDER BY report_fetched_at ASC NULLS FIRST, facility_id, source_id LIMIT %s''', (limit,)).fetchall()
+    for facility_id, inspection_id, url, template in rows:
+        result = fetch_report(source, url, template)
+        with conn.transaction():
+            if isinstance(result, Exception):
+                db.save_report_error(conn, facility_id, inspection_id, result)
+                conn.execute('UPDATE etl_runs SET report_errors=report_errors+1 WHERE id=%s', (run_id,))
+            elif result is not None:
+                fields, raw, conversions = result
+                db.save_report(conn, facility_id, inspection_id, fields, raw)
+                conn.execute('''UPDATE etl_runs SET conversion_errors=conversion_errors+%s,
+                    counters=jsonb_set(counters, '{parsed_reports}',
+                    to_jsonb(COALESCE((counters->>'parsed_reports')::int,0)+1), true) WHERE id=%s''',
+                             (conversions, run_id))
     return 'bounded'
 
 
@@ -67,7 +105,7 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
         unchanged = not full and stored is not None and stored[0] == f
         needs_reports = (unchanged and reports and (remaining is None or remaining > 0)
                          and conn.execute('''SELECT EXISTS (SELECT 1 FROM inspections
-                             WHERE facility_id = %s AND report_fields IS NULL)''',
+                             WHERE facility_id = %s AND report_fields IS NULL AND report_error IS NULL)''',
                                           (facility['source_id'],)).fetchone()[0])
         if unchanged and not needs_reports:
             fetched.append({'facility': f, 'inspections': entries, 'skipped': True})
@@ -76,18 +114,13 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
             entry = {'inspection': raw}
             i = transform.inspection(raw, facility['source_id'], [0])
             if reports and (remaining is None or remaining > 0):
-                stored_report = conn.execute('SELECT report_fields IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
+                stored_report = conn.execute('SELECT report_fields IS NOT NULL OR report_error IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
                 if not (stored_report and stored_report[0]):
                     if remaining is not None:
                         remaining -= 1
-                    try:
-                        page = source.report(i['printable_url'])
-                        # Parse before ingest to make failures non-fatal to the page.
-                        report_conversions = [0]
-                        fields, raw_header = transform.report(page, i['report_template'], report_conversions)
-                        entry['report'] = (fields, raw_header, report_conversions[0])
-                    except Exception as exc:
-                        entry['report'] = exc
+                    result = fetch_report(source, i['printable_url'], i['report_template'])
+                    if result is not None:
+                        entry['report'] = result
             entries.append(entry)
         fetched.append({'facility': f, 'inspections': entries})
     return fetched, remaining

@@ -28,10 +28,11 @@ def main():
     parser.add_argument('--full', action='store_true')
     parser.add_argument('--overlap-days', type=nonnegative, default=14)
     parser.add_argument('--reports', action='store_true')
+    parser.add_argument('--retry-report-errors', action='store_true')
     parser.add_argument('--max-reports', type=positive)
     args = parser.parse_args()
-    if args.max_reports is not None and not args.reports:
-        parser.error('--max-reports requires --reports')
+    if args.max_reports is not None and not (args.reports or args.retry_report_errors):
+        parser.error('--max-reports requires --reports or --retry-report-errors')
     with psycopg.connect(autocommit=True) as conn:
         db.init(conn)
         run_id = db.start(conn, vars(args))

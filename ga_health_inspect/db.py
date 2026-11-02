@@ -47,5 +47,5 @@ def save_report(conn, facility_id, inspection_id, fields, raw):
 
 
 def save_report_error(conn, facility_id, inspection_id, exc):
-    conn.execute('UPDATE inspections SET report_error=%s WHERE facility_id=%s AND source_id=%s',
+    conn.execute('UPDATE inspections SET report_error=%s, report_fetched_at=now() WHERE facility_id=%s AND source_id=%s',
                  (f'{type(exc).__name__}: {exc}', facility_id, inspection_id))

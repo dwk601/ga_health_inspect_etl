@@ -31,16 +31,34 @@ class SourceTest(unittest.TestCase):
             with mock.patch('ga_health_inspect.source.time.sleep'):
                 self.assertEqual(source.search(1525), expected)
 
-    def test_report_survives_unclosed_login_redirect_script(self):
-        body = b'''<html><body><table><tr><td><b>Establishment Name:</b> Example</td></tr>
+    def test_report_headers(self):
+        food = b'''<table><tr><td><b>Establishment Name:</b> Example</td></tr>
             <tr><td><b>Inspection Date:</b> 01/30/2026</td></tr></table>
             <div><script>document.location.href="login.cfm?attempt=</div>
-            <div id="div_finalScore">100</div><div id="div_grade">A</div>
-            <script type="text/javascript">var x = 1;</script></body></html>'''
-        source = Source()
-        source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(status=200, body=body, encoding='utf-8'))
-        fields, raw = transform.report(source.report('https://example.test/r'), 'food_2015', [0])
-        self.assertEqual((fields['score'], fields['grade']), ('100', 'A'))
+            <div id="div_finalScore">100</div><div id="div_grade">A</div>'''
+        pool = b'''<table><tr><td><b>Facility Name:</b> Example</td></tr>
+            <tr><td><b>Inspection Date:</b> 01/30/2026</td></tr>%s</table>'''
+        legacy = b'''<table><tr><td></td><td>Name of Facility</td><td>Address</td><td>City</td></tr>
+            <tr><td></td><td>Example</td><td>1 Main</td><td>Atlanta</td></tr>
+            <tr><td>Permit No.</td></tr><tr><td>P-1</td></tr>
+            <tr><td></td><td>Date of Inspection</td></tr><tr><td></td><td>01/30/2026</td></tr></table>'''
+        cases = [('food_2015', food, ('100', 'A')), ('pool_2017', pool % b'<tr><td class="ArialEighteen" rowspan="2"><strong></strong></td></tr>', (None, None)),
+                 ('pool_2017', pool % b'<tr><td class="ArialEighteen" rowspan="2"><strong><html><hea</strong></td></tr>', (None, None)),
+                 ('Pool', legacy, (None, None)), ('pool_2017', pool % b'', None)]
+        cases += [(template, b'<html>garbage</html>', None) for template in ('food_2015', 'pool_2017', 'Pool', 'Tourist2014')]
+        for template, body, expected in cases:
+            with self.subTest(template=template, body=body):
+                source = Source()
+                source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(status=200, body=body, encoding='utf-8'))
+                page = source.report('https://example.test/r')
+                if expected is None:
+                    with self.assertRaises(ValueError):
+                        transform.report(page, template, [0])
+                else:
+                    fields, raw = transform.report(page, template, [0])
+                    self.assertEqual((fields['name'], fields['inspection_date'], fields['score'], fields['grade']), ('Example', '2026-01-30', *expected))
+                    if template == 'Pool':
+                        self.assertEqual((fields['address'], fields['city'], fields['permit_number']), ('1 Main', 'Atlanta', 'P-1'))
 
     def test_inspections_normalize_source_quirks(self):
         placeholder = {'printablePath': '', 'inspectionId': 0, 'facilityId': 'YWJj',
@@ -72,6 +90,8 @@ class LifecycleTest(unittest.TestCase):
             def __init__(self):
                 self.searches = []
                 self.requests = []
+                self.reports = []
+                self.fail_report = False
 
             def search(self, page):
                 self.searches.append(page)
@@ -84,7 +104,12 @@ class LifecycleTest(unittest.TestCase):
                 return [inspection]
 
             def report(self, url):
-                raise AssertionError('reports are disabled')
+                self.reports.append(url)
+                if self.fail_report:
+                    raise RuntimeError('network unavailable')
+                return Selector('''<table><tr><td><b>Establishment Name:</b> Example</td></tr>
+                    <tr><td><b>Inspection Date:</b> 01/02/2024</td></tr></table>
+                    <div id="div_finalScore">90</div>''')
 
         options = dict(start_page=0, max_pages=1, full=False, overlap_days=14, reports=False, max_reports=None)
         with psycopg.connect(autocommit=True) as conn:
@@ -113,6 +138,32 @@ class LifecycleTest(unittest.TestCase):
                     self.assertEqual(conn.execute("SELECT next_page, (counters->>'skipped_facilities')::int, options->>'cutoff' FROM etl_runs WHERE id=%s", (run_id,)).fetchone(),
                                      (3, 2, (today - timedelta(days=14)).isoformat()))
                     self.assertEqual(conn.execute("SELECT source_id, name FROM facilities WHERE source_id IN ('A', 'D') ORDER BY source_id").fetchall(), [('A', 'A updated'), ('D', 'D')])
+                    conn.execute("UPDATE inspections SET report_error='bad report', report_fetched_at=now() WHERE facility_id='A'")
+                    options.update(reports=True, max_pages=1, max_reports=1)
+                    source = Source()
+                    self.assertEqual(execute(source)[1], 'bounded')
+                    self.assertEqual((source.requests, source.reports), ([], []))
+                    facilities[0]['name'] = 'A changed again'
+                    source = Source()
+                    execute(source)
+                    self.assertEqual((source.requests, source.reports), (['A'], []))
+                    options['retry_report_errors'] = True
+                    source = Source()
+                    retry_id, status = execute(source)
+                    self.assertEqual((status, source.searches, source.requests, len(source.reports)), ('bounded', [], [], 1))
+                    self.assertEqual(conn.execute("SELECT report_error, report_fields->>'score' FROM inspections WHERE facility_id='A'").fetchone(), (None, '90'))
+                    self.assertEqual(db.cutoff(conn, retry_id, options), today - timedelta(days=14))
+                    options.update(retry_report_errors=False, start_page=1)
+                    source = Source()
+                    source.fail_report = True
+                    with mock.patch('sys.stderr'):
+                        self.assertEqual(execute(source)[1], 'bounded')
+                    self.assertEqual(len(source.reports), 1)
+                    self.assertEqual(conn.execute("SELECT report_error, report_fields FROM inspections WHERE facility_id='B'").fetchone(), (None, None))
+                    source = Source()
+                    execute(source)
+                    self.assertEqual(len(source.reports), 1)
+                    self.assertEqual(conn.execute("SELECT report_fields->>'score' FROM inspections WHERE facility_id='B'").fetchone()[0], '90')
                     raise Rollback()
             except Rollback:
                 pass

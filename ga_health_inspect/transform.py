@@ -130,8 +130,11 @@ def food_report(page):
 def pool_report(page):
     raw = common_cells(page, 'Facility Name:', 'Facility Address:', 'Permit Number:')
     raw.update(time_in=cell_value(page, 'Time In:'), time_out=cell_value(page, 'Time Out:'))
-    scores = page.xpath('//td[contains(@class,"ArialEighteen") and @rowspan]/strong/text()').getall()
-    raw.update(score=scores[0].strip() if scores else None, grade=None)
+    containers = page.xpath('//td[contains(@class,"ArialEighteen") and @rowspan]/strong')
+    if not containers:
+        raise ValueError('Report score container not recognized')
+    scores = containers[0].xpath('./text()').getall()
+    raw.update(score=scores[0].strip() or None if scores else None, grade=None)
     return raw
 
 
@@ -149,14 +152,34 @@ def tourist_report(page):
     return raw
 
 
-REPORT_EXTRACTORS = {'food_2015': food_report, 'pool_2017': pool_report, 'Tourist2014': tourist_report}
+def legacy_pool_report(page):
+    raw = {}
+    for key, label in [('name', 'Name of Facility'), ('address', 'Address'), ('city', 'City'),
+                       ('permit_number', 'Permit No.'), ('inspection_date', 'Date of Inspection')]:
+        raw[key] = None
+        for row in page.xpath('//tr'):
+            cells = row.xpath('./td|./th')
+            for index, cell in enumerate(cells):
+                if text(cell) == label:
+                    following = row.xpath('./following-sibling::tr[1]/*[self::td or self::th]')
+                    if index < len(following):
+                        raw[key] = text(following[index]) or None
+                    break
+            if raw[key]:
+                break
+    raw.update(score=None, grade=None, time_in=None, time_out=None)
+    return raw
+
+
+REPORT_EXTRACTORS = {'food_2015': food_report, 'pool_2017': pool_report,
+                     'Pool': legacy_pool_report, 'Tourist2014': tourist_report}
 
 
 def report(page, template, errors):
     if template not in REPORT_EXTRACTORS:
         raise ValueError('Unknown report template: ' + template)
     raw = REPORT_EXTRACTORS[template](page)
-    if not raw['name'] or not raw['inspection_date'] or raw['score'] is None:
+    if not raw['name'] or not raw['inspection_date'] or (template not in ('Pool', 'pool_2017') and not raw['score']):
         raise ValueError('Report header not recognized')
     fields = dict(raw)
     fields['inspection_date'] = date(raw['inspection_date'], '%m/%d/%Y', errors)
