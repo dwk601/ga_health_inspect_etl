@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS violations (
  PRIMARY KEY (facility_id, inspection_id, snapshot_hash, source_key),
  FOREIGN KEY (facility_id, inspection_id) REFERENCES inspections(facility_id, source_id)
 );
+CREATE OR REPLACE VIEW current_violations AS
+ SELECT v.* FROM violations v JOIN inspections i
+ ON v.facility_id = i.facility_id AND v.inspection_id = i.source_id
+ AND v.snapshot_hash = i.violations_hash;
 CREATE TABLE IF NOT EXISTS etl_runs (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, started timestamptz NOT NULL DEFAULT now(), finished timestamptz,
  status text NOT NULL CHECK (status IN ('running','bounded','exhausted','caught_up','failed','interrupted')),

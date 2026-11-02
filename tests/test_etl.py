@@ -58,9 +58,9 @@ class SourceTest(unittest.TestCase):
                 page = source.report('https://example.test/r')
                 if expected is None:
                     with self.assertRaises(ValueError):
-                        transform.report(page, template, [0])
+                        transform.report(page, template, [])
                 else:
-                    fields, raw = transform.report(page, template, [0])
+                    fields, raw = transform.report(page, template, [])
                     self.assertEqual((fields['name'], fields['inspection_date']), ('Example', '2026-01-30'))
                     self.assertEqual({key: fields[key] for key in expected}, expected)
         source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(status=200, body=b'<title>Page Temporarily Unavailable</title>', encoding='utf-8'))
@@ -291,9 +291,9 @@ class LifecycleTest(unittest.TestCase):
             <tr><td><b>Time In:</b></td><td>bad</td><td>:</td><td>30</td><td>AM</td></tr>
             <tr><td><b>Time Out:</b></td><td>10</td><td>:</td><td>30</td><td>AM</td></tr></table>
             <div id="div_finalScore">90</div>''')
-        errors = [0]
+        errors = []
         parsed, raw = transform.report(page, 'food_2015', errors)
-        self.assertEqual((raw['time_in'], parsed['time_in'], parsed['time_out'], errors[0]),
+        self.assertEqual((raw['time_in'], parsed['time_in'], parsed['time_out'], len(errors)),
                          ('bad:30 AM', None, '10:30:00', 1))
 
         facility = copy.deepcopy(FACILITY)
@@ -308,11 +308,14 @@ class LifecycleTest(unittest.TestCase):
                     db.init(conn)
                     run = db.start(conn, {'start_page': 0})
                     fetched, _, _ = fetch_page(conn, source, [facility], False, None, True)
-                    fetched[0]['inspections'][0]['report'] = (fields, raw, errors[0])
+                    fetched[0]['inspections'][0]['report'] = (fields, raw, errors)
                     ingest_page(conn, run, 0, fetched, 0)
                     self.assertEqual(conn.execute('SELECT name, permit_number, last_inspection_date::text FROM facilities').fetchone(), ('Example', 'F-1', '2024-01-02'))
                     self.assertEqual(conn.execute('SELECT inspection_date::text, score, report_fields, report_raw FROM inspections').fetchone(), (None, 90, fields, raw))
                     self.assertEqual(conn.execute("SELECT (counters->>'parsed_reports')::int, conversion_errors FROM etl_runs WHERE id=%s", (run,)).fetchone(), (1, 2))
+                    samples = conn.execute("SELECT options->'conversion_samples' FROM etl_runs WHERE id=%s", (run,)).fetchone()[0]
+                    self.assertEqual(samples[0], {'facility_id': 'YWJj', 'inspection_id': 42, 'entity': 'inspection', 'field': 'inspection_date', 'value': '1-2-2024', 'reason': 'invalid date'})
+                    self.assertEqual(samples[1], {'facility_id': 'YWJj', 'inspection_id': 42, 'entity': 'report', 'field': 'time_in', 'value': 'bad:30 AM', 'reason': 'invalid time'})
                     self.assertEqual(conn.execute('SELECT code_title, points, corrected, repeat, notes FROM violations').fetchone(), ('1. Item', 2, True, False, 'Fix'))
                     replay = copy.deepcopy(fetched)
                     del replay[0]['inspections'][0]['report']
@@ -326,11 +329,12 @@ class LifecycleTest(unittest.TestCase):
                     new_hash = conn.execute('SELECT violations_hash FROM inspections').fetchone()[0]
                     self.assertNotEqual(old_hash, new_hash)
                     self.assertEqual(conn.execute('SELECT snapshot_hash, points FROM violations ORDER BY points').fetchall(), [(old_hash, 2), (new_hash, 3)])
+                    self.assertEqual(conn.execute('SELECT snapshot_hash, points FROM current_violations').fetchall(), [(new_hash, 3)])
                     replay[0]['inspections'][0]['report'] = RuntimeError('x')
                     ingest_page(conn, run, 0, replay, 0)
                     self.assertEqual(conn.execute('SELECT report_error FROM inspections').fetchone()[0], 'RuntimeError: x')
                     self.assertEqual(conn.execute('SELECT report_errors FROM etl_runs WHERE id=%s', (run,)).fetchone()[0], 1)
-                    replay[0]['inspections'][0]['report'] = (fields, raw, errors[0])
+                    replay[0]['inspections'][0]['report'] = (fields, raw, errors)
                     ingest_page(conn, run, 0, replay, 0)
                     self.assertIsNone(conn.execute('SELECT report_error FROM inspections').fetchone()[0])
                     raise Rollback()

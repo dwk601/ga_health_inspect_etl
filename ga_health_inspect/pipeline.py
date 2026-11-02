@@ -1,5 +1,7 @@
 import sys
 
+from psycopg.types.json import Jsonb
+
 from . import db, transform
 
 
@@ -50,9 +52,9 @@ def fetch_report(source, url, template):
         print(f'Report fetch failed for {url}: {exc}', file=sys.stderr, flush=True)
         return ReportTransportError(str(exc))
     try:
-        conversions = [0]
+        conversions = []
         fields, raw = transform.report(page, template, conversions)
-        return fields, raw, conversions[0]
+        return fields, raw, conversions
     except Exception as exc:
         return exc
 
@@ -61,10 +63,10 @@ def save_report_result(conn, facility_id, inspection_id, result):
     if isinstance(result, ReportTransportError):
         conn.execute('UPDATE inspections SET report_fetched_at=now() WHERE facility_id=%s AND source_id=%s',
                      (facility_id, inspection_id))
-        return 0, 1, 0
+        return 0, 1, []
     if isinstance(result, Exception):
         db.save_report_error(conn, facility_id, inspection_id, result)
-        return 0, 1, 0
+        return 0, 1, []
     fields, raw, conversions = result
     db.save_report(conn, facility_id, inspection_id, fields, raw)
     return 1, 0, conversions
@@ -78,6 +80,21 @@ def update_report_counters(conn, run_id, parsed, failures, conversions):
                  (failures, conversions, parsed, run_id))
 
 
+def record_conversions(conn, run_id, errors):
+    samples = conn.execute("SELECT COALESCE(options->'conversion_samples', '[]'::jsonb) FROM etl_runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()[0]
+    for error in errors[:max(0, 20 - len(samples))]:
+        samples.append(error)
+        print(f'Conversion error: {error}', file=sys.stderr, flush=True)
+    conn.execute("UPDATE etl_runs SET options=jsonb_set(options, '{conversion_samples}', %s) WHERE id=%s", (Jsonb(samples), run_id))
+
+
+def contextualize(errors, facility_id, entity, inspection_id=None):
+    context = {'facility_id': facility_id, 'entity': entity}
+    if inspection_id is not None:
+        context['inspection_id'] = inspection_id
+    return [dict(context, field=field, value=value, reason=reason) for field, value, reason in errors]
+
+
 def retry_report_errors(conn, source, run_id, limit):
     rows = conn.execute('''SELECT facility_id, source_id, printable_url, report_template
         FROM inspections WHERE report_error IS NOT NULL
@@ -85,21 +102,23 @@ def retry_report_errors(conn, source, run_id, limit):
     for facility_id, inspection_id, url, template in rows:
         result = fetch_report(source, url, template)
         with conn.transaction():
-            counts = save_report_result(conn, facility_id, inspection_id, result)
-            update_report_counters(conn, run_id, *counts)
+            parsed, failures, conversions = save_report_result(conn, facility_id, inspection_id, result)
+            record_conversions(conn, run_id, contextualize(conversions, facility_id, 'report', inspection_id))
+            update_report_counters(conn, run_id, parsed, failures, len(conversions))
     return 'bounded'
 
 
 def ingest_page(conn, run_id, page, fetched, invalid_count):
-    errors = [0]
+    errors = []
     count_inspections = count_violations = count_reports = report_errors = 0
     with conn.transaction():
         for item in fetched:
             f = item['facility']
-            errors[0] += item['conversion_errors']
+            errors.extend(item['conversion_errors'])
             db.upsert(conn, 'facilities', f, ('source_id',))
             for entry in item['inspections']:
                 i = entry['inspection']
+                errors.extend(entry['conversion_errors'])
                 db.upsert(conn, 'inspections', i, ('facility_id', 'source_id'))
                 count_inspections += 1
                 for v in entry['violations']:
@@ -110,7 +129,7 @@ def ingest_page(conn, run_id, page, fetched, invalid_count):
                     parsed, failures, conversions = save_report_result(conn, f['source_id'], i['source_id'], entry['report'])
                     count_reports += parsed
                     report_errors += failures
-                    errors[0] += conversions
+                    errors.extend(contextualize(conversions, f['source_id'], 'report', i['source_id']))
         conn.execute("""UPDATE etl_runs SET next_page=%s,
             counters=jsonb_build_object('facilities',COALESCE((counters->>'facilities')::int,0)+%s,
               'inspections',COALESCE((counters->>'inspections')::int,0)+%s,
@@ -120,21 +139,23 @@ def ingest_page(conn, run_id, page, fetched, invalid_count):
               'invalid_facilities',COALESCE((counters->>'invalid_facilities')::int,0)+%s) WHERE id=%s""",
             (page + 1, len(fetched), count_inspections, count_violations,
              sum(item.get('skipped', False) for item in fetched), invalid_count, run_id))
-        update_report_counters(conn, run_id, count_reports, report_errors, errors[0])
+        record_conversions(conn, run_id, errors)
+        update_report_counters(conn, run_id, count_reports, report_errors, len(errors))
 
 
 def fetch_page(conn, source, facilities, reports, remaining, full):
     fetched = []
     invalid = []
     for f in facilities:
-        errors = [0]
+        conversions = []
         try:
-            facility = transform.facility(f, errors)
+            facility = transform.facility(f, conversions)
         except ValueError as exc:
             facility_id = str(f.get('id', '<missing>')) if isinstance(f, dict) else '<missing>'
             print(f'Invalid facility {facility_id}: {exc}', file=sys.stderr, flush=True)
             invalid.append(facility_id)
             continue
+        errors = contextualize(conversions, facility['source_id'], 'facility')
         entries = []
         stored = conn.execute('SELECT raw FROM facilities WHERE source_id = %s',
                               (facility['source_id'],)).fetchone()
@@ -144,14 +165,20 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
                              WHERE facility_id = %s AND report_fields IS NULL AND report_error IS NULL)''',
                                           (facility['source_id'],)).fetchone()[0])
         if unchanged and not needs_reports:
-            fetched.append({'facility': facility, 'inspections': entries, 'skipped': True, 'conversion_errors': errors[0]})
+            fetched.append({'facility': facility, 'inspections': entries, 'skipped': True, 'conversion_errors': errors})
             continue
         try:
             inspections = source.inspections(facility['source_id'])
             for raw in inspections:
-                inspection = transform.inspection(raw, facility['source_id'], errors)
-                violations = [transform.violation(key, value, errors) for key, value in raw['violations'].items()]
-                entries.append({'inspection': inspection, 'violations': violations})
+                conversions = []
+                inspection = transform.inspection(raw, facility['source_id'], conversions)
+                inspection_errors = contextualize(conversions, facility['source_id'], 'inspection', inspection['source_id'])
+                violations = []
+                for key, value in raw['violations'].items():
+                    conversions = []
+                    violations.append(transform.violation(key, value, conversions))
+                    inspection_errors.extend(contextualize(conversions, facility['source_id'], key, inspection['source_id']))
+                entries.append({'inspection': inspection, 'violations': violations, 'conversion_errors': inspection_errors})
         except ValueError as exc:
             print(f"Invalid facility {facility['source_id']}: {exc}", file=sys.stderr, flush=True)
             invalid.append(facility['source_id'])
@@ -164,5 +191,5 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
                     if remaining is not None:
                         remaining -= 1
                     entry['report'] = fetch_report(source, i['printable_url'], i['report_template'])
-        fetched.append({'facility': facility, 'inspections': entries, 'conversion_errors': errors[0]})
+        fetched.append({'facility': facility, 'inspections': entries, 'conversion_errors': errors})
     return fetched, remaining, invalid

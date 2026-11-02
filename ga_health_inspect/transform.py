@@ -13,7 +13,7 @@ def labels(columns):
             for v in columns.values() if ':' in v}
 
 
-def date(value, fmt, errors):
+def date(value, fmt, errors, field):
     if not value or value.strip().upper() == 'NA':
         return None
     try:
@@ -22,11 +22,11 @@ def date(value, fmt, errors):
             raise ValueError('noncanonical date')
         return parsed.date().isoformat()
     except (ValueError, TypeError):
-        errors[0] += 1
+        errors.append((field, str(value)[:200], 'invalid date'))
         return None
 
 
-def number(value, errors):
+def number(value, errors, field):
     if value is None or str(value).strip().upper() in ('', 'NA', 'N/A'):
         return None
     try:
@@ -35,7 +35,7 @@ def number(value, errors):
             raise InvalidOperation
         return n
     except InvalidOperation:
-        errors[0] += 1
+        errors.append((field, str(value)[:200], 'invalid number'))
         return None
 
 
@@ -45,8 +45,8 @@ def facility(raw, errors):
     c = labels(raw.get('columns'))
     return dict(source_id=raw['id'], name=raw.get('name'), address=raw.get('mapAddress'),
                 phone=c.get('phone number'), permit_type=c.get('permit type'), permit_number=c.get('permit number'),
-                last_inspection_date=date(c.get('last inspection date'), '%m-%d-%Y', errors),
-                last_inspection_score=number(c.get('last inspection score'), errors), raw=raw)
+                last_inspection_date=date(c.get('last inspection date'), '%m-%d-%Y', errors, 'last_inspection_date'),
+                last_inspection_score=number(c.get('last inspection score'), errors, 'last_inspection_score'), raw=raw)
 
 
 def inspection(raw, facility_id, errors):
@@ -60,8 +60,8 @@ def inspection(raw, facility_id, errors):
     url, template = report_url(raw.get('printablePath'))
     digest = hashlib.sha256(json.dumps(violations, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
     return dict(facility_id=facility_id, source_id=raw['inspectionId'], report_template=template,
-                inspection_date=date(c.get('date'), '%m-%d-%Y', errors), purpose=c.get('inspection purpose'),
-                score=number(c.get('score'), errors), inspector=c.get('inspector'), printable_url=url,
+                inspection_date=date(c.get('date'), '%m-%d-%Y', errors, 'inspection_date'), purpose=c.get('inspection purpose'),
+                score=number(c.get('score'), errors, 'score'), inspector=c.get('inspector'), printable_url=url,
                 raw=raw, violations_hash=digest)
 
 
@@ -77,15 +77,15 @@ def violation(key, values, errors):
         elif ':' in v:
             k, val = v.split(':', 1)
             fields[k.lower().strip()] = val.strip()
-    def boolean(value):
+    def boolean(value, field):
         if not value:
             return None
         if value.lower() in ('yes', 'no'):
             return value.lower() == 'yes'
-        errors[0] += 1
+        errors.append((field, str(value)[:200], 'invalid boolean'))
         return None
-    return dict(source_key=key, code_title=values[0], regulation=values[1], points=number(fields.get('points'), errors),
-                corrected=boolean(fields.get('corrected during inspection?')), repeat=boolean(fields.get('repeat')),
+    return dict(source_key=key, code_title=values[0], regulation=values[1], points=number(fields.get('points'), errors, 'points'),
+                corrected=boolean(fields.get('corrected during inspection?'), 'corrected'), repeat=boolean(fields.get('repeat'), 'repeat'),
                 notes=fields.get('inspector notes'), raw=values)
 
 
@@ -183,8 +183,8 @@ def report(page, template, errors):
     if not raw['name'] or not raw['inspection_date']:
         raise ValueError('Report header not recognized')
     fields = dict(raw)
-    fields['inspection_date'] = date(raw['inspection_date'], '%m/%d/%Y', errors)
-    score = number(raw['score'], errors)
+    fields['inspection_date'] = date(raw['inspection_date'], '%m/%d/%Y', errors, 'inspection_date')
+    score = number(raw['score'], errors, 'score')
     fields['score'] = str(score) if score is not None else None
     for key in ('time_in', 'time_out'):
         value = raw[key]
@@ -193,5 +193,5 @@ def report(page, template, errors):
             try:
                 fields[key] = datetime.strptime(value.strip(), '%I:%M %p').strftime('%H:%M:%S')
             except ValueError:
-                errors[0] += 1
+                errors.append((key, str(value)[:200], 'invalid time'))
     return fields, raw
