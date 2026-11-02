@@ -65,7 +65,7 @@ def main():
                 status, next_page, counters, conversions, report_errors, options = conn.execute(
                     'SELECT status, next_page, counters, conversion_errors, report_errors, options FROM etl_runs WHERE id=%s',
                     (run_id,)).fetchone()
-                backlog = conn.execute('SELECT count(*) FROM inspections WHERE report_error IS NOT NULL').fetchone()[0]
+                backlog = conn.execute(f'SELECT count(*) FROM inspections WHERE {db.REPORT_ERROR_BACKLOG}').fetchone()[0]
                 print(f'status={status} next_page={next_page} cutoff={options.get("cutoff")} counters={counters} conversion_errors={conversions} report_errors={report_errors} report_error_backlog={backlog}', flush=True)
             except Exception as exc:
                 print(f'Could not query run summary: {exc}', file=sys.stderr)

@@ -203,6 +203,22 @@ class LifecycleTest(unittest.TestCase):
                     self.assertEqual(len(source.reports), 1)
                     self.assertEqual(conn.execute("SELECT report_error, report_fields FROM inspections WHERE facility_id='B'").fetchone(), (None, None))
                     source = Source()
+                    source.fail_report = True
+                    @contextmanager
+                    def scoped_connect(**kwargs):
+                        try:
+                            yield conn
+                        finally:
+                            conn.execute('SELECT pg_advisory_unlock(%s)', (db.RUN_LOCK_KEY,))
+                    source_context = mock.MagicMock()
+                    source_context.__enter__.return_value = source
+                    with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
+                         mock.patch.object(cli, 'Source', return_value=source_context), \
+                         mock.patch('sys.argv', ['etl', '--retry-report-errors']), mock.patch('builtins.print') as output:
+                        self.assertEqual(cli.main(), 0)
+                    self.assertEqual(len(source.reports), 1)
+                    self.assertIn('report_error_backlog=1', output.call_args.args[0])
+                    source = Source()
                     execute(source)
                     self.assertEqual(len(source.reports), 1)
                     self.assertEqual(conn.execute("SELECT report_fields->>'score' FROM inspections WHERE facility_id='B'").fetchone()[0], '90')

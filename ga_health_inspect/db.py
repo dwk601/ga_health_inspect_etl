@@ -3,6 +3,7 @@ from psycopg.types.json import Jsonb
 
 
 RUN_LOCK_KEY = 0x47414845414C5448
+REPORT_ERROR_BACKLOG = 'report_fields IS NULL AND (report_error IS NOT NULL OR report_fetched_at IS NOT NULL)'
 
 
 def try_run_lock(conn):

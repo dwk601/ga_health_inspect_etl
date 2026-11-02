@@ -73,7 +73,7 @@ def save_report_result(conn, facility_id, inspection_id, result):
     return 1, 0, conversions
 
 
-def update_report_counters(conn, run_id, parsed, failures, conversion_count):
+def add_run_counters(conn, run_id, parsed, failures, conversion_count):
     conn.execute('''UPDATE etl_runs SET report_errors=report_errors+%s,
         conversion_errors=conversion_errors+%s,
         counters=jsonb_set(counters, '{parsed_reports}',
@@ -104,15 +104,15 @@ def contextualize(errors, facility_id, entity, inspection_id=None, violation_key
 
 
 def retry_report_errors(conn, source, run_id, limit):
-    rows = conn.execute('''SELECT facility_id, source_id, printable_url, report_template
-        FROM inspections WHERE report_error IS NOT NULL
+    rows = conn.execute(f'''SELECT facility_id, source_id, printable_url, report_template
+        FROM inspections WHERE {db.REPORT_ERROR_BACKLOG}
         ORDER BY report_fetched_at ASC NULLS FIRST, facility_id, source_id LIMIT %s''', (limit,)).fetchall()
     for facility_id, inspection_id, url, template in rows:
         result = fetch_report(source, url, template)
         with conn.transaction():
             parsed, failures, conversions = save_report_result(conn, facility_id, inspection_id, result)
             record_conversions(conn, run_id, contextualize(conversions, facility_id, 'report', inspection_id))
-            update_report_counters(conn, run_id, parsed, failures, len(conversions))
+            add_run_counters(conn, run_id, parsed, failures, len(conversions))
     return 'bounded'
 
 
@@ -148,7 +148,7 @@ def ingest_page(conn, run_id, page, fetched, invalid_count):
             (page + 1, len(fetched), count_inspections, count_violations,
              sum(item.get('skipped', False) for item in fetched), invalid_count, run_id))
         record_conversions(conn, run_id, errors)
-        update_report_counters(conn, run_id, count_reports, report_errors, len(errors))
+        add_run_counters(conn, run_id, count_reports, report_errors, len(errors))
 
 
 def fetch_page(conn, source, facilities, reports, remaining, full):
