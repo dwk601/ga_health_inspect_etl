@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: health
       POSTGRES_DB: health
@@ -14,6 +15,10 @@ services:
       retries: 30
   etl:
     build: .
+    # Idles so runs are started with `docker compose exec etl python -m ga_health_inspect ...` (Coolify scheduled task, local verify).
+    entrypoint: ["sleep", "infinity"]
+    init: true
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
