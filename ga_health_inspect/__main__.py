@@ -1,4 +1,5 @@
 import argparse
+import signal
 import sys
 
 import psycopg
@@ -37,8 +38,13 @@ def main():
         args.start_page = 0
     if args.max_reports is not None and not (args.reports or args.retry_report_errors):
         parser.error('--max-reports requires --reports or --retry-report-errors')
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     with psycopg.connect(autocommit=True) as conn:
+        if not conn.execute('SELECT pg_try_advisory_lock(%s)', (db.RUN_LOCK_KEY,)).fetchone()[0]:
+            print('Another ETL run holds the advisory lock', file=sys.stderr)
+            return 1
         db.init(conn)
+        conn.execute("UPDATE etl_runs SET status='interrupted', finished=now(), error='Process ended without finishing' WHERE status='running'")
         run_id = db.start(conn, vars(args))
         try:
             with Source() as source:
@@ -53,10 +59,13 @@ def main():
             print(f'ETL failed: {exc}', file=sys.stderr)
             return 1
         finally:
-            status, next_page, counters, conversions, report_errors, options = conn.execute(
-                'SELECT status, next_page, counters, conversion_errors, report_errors, options FROM etl_runs WHERE id=%s',
-                (run_id,)).fetchone()
-            print(f'status={status} next_page={next_page} cutoff={options.get("cutoff")} counters={counters} conversion_errors={conversions} report_errors={report_errors}', flush=True)
+            try:
+                status, next_page, counters, conversions, report_errors, options = conn.execute(
+                    'SELECT status, next_page, counters, conversion_errors, report_errors, options FROM etl_runs WHERE id=%s',
+                    (run_id,)).fetchone()
+                print(f'status={status} next_page={next_page} cutoff={options.get("cutoff")} counters={counters} conversion_errors={conversions} report_errors={report_errors}', flush=True)
+            except Exception as exc:
+                print(f'Could not query run summary: {exc}', file=sys.stderr)
 
 
 if __name__ == '__main__':

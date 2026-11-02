@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 import psycopg
 from scrapling.parser import Selector
 
-from ga_health_inspect import db, pipeline, transform, __main__
+from ga_health_inspect import db, pipeline, transform
+from ga_health_inspect import __main__ as cli
 from ga_health_inspect.pipeline import ingest_page
 from ga_health_inspect.source import Source
 
@@ -69,7 +70,7 @@ class SourceTest(unittest.TestCase):
         for option in (['--reports'], ['--full'], ['--start-page', '0'], ['--max-pages', '1']):
             with self.subTest(option=option), mock.patch('sys.argv', ['etl', '--retry-report-errors', *option]), mock.patch('sys.stderr'):
                 with self.assertRaises(SystemExit) as error:
-                    __main__.main()
+                    cli.main()
                 self.assertEqual(error.exception.code, 2)
 
     def test_inspections_normalize_source_quirks(self):
@@ -83,6 +84,21 @@ class SourceTest(unittest.TestCase):
                 status=200, body=json.dumps(next(responses)).encode()))
             with mock.patch('ga_health_inspect.source.time.sleep'), mock.patch('sys.stderr'):
                 self.assertEqual(source.inspections('YWJj'), [INSPECTION])
+
+        source = Source()
+        responses = iter([SimpleNamespace(status=429, body=b''),
+                          SimpleNamespace(status=200, body=b'{'),
+                          SimpleNamespace(status=200, body=b'{}'),
+                          SimpleNamespace(status=200, body=json.dumps([INSPECTION]).encode())])
+        source.session = SimpleNamespace(get=lambda url, **kwargs: next(responses))
+        with mock.patch('ga_health_inspect.source.time.sleep'):
+            self.assertEqual(source.inspections('YWJj'), [INSPECTION])
+        responses = iter([other_facility] * 3)
+        source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(
+            status=200, body=json.dumps([next(responses)]).encode()))
+        with mock.patch('ga_health_inspect.source.time.sleep'), mock.patch('sys.stderr'):
+            with self.assertRaises(ValueError):
+                source.inspections('YWJj')
 
 
 class LifecycleTest(unittest.TestCase):
@@ -188,9 +204,67 @@ class LifecycleTest(unittest.TestCase):
                     execute(source)
                     self.assertEqual(len(source.reports), 1)
                     self.assertEqual(conn.execute("SELECT report_fields->>'score' FROM inspections WHERE facility_id='B'").fetchone()[0], '90')
+                    options.update(start_page=0, max_pages=None, reports=False, full=True)
+                    empty = Source()
+                    empty.search = lambda page: []
+                    run_id = db.start(conn, options)
+                    with self.assertRaisesRegex(RuntimeError, 'Unexpected empty page'):
+                        pipeline.run(conn, empty, run_id, options)
                     raise Rollback()
             except Rollback:
                 pass
+
+    def test_run_reconciliation_and_invalid_facility(self):
+        connect = psycopg.connect
+        with connect(autocommit=True) as admin:
+            admin.execute('CREATE SCHEMA etl_run_test')
+            try:
+                def scoped_connect(**kwargs):
+                    return connect(options='-c search_path=etl_run_test', **kwargs)
+
+                class TestSource:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        pass
+
+                    def search(self, page):
+                        return [[dict(FACILITY, id='bad'), dict(FACILITY, id='good')],
+                                [dict(FACILITY, id='later')], []][page]
+
+                    def inspections(self, facility_id):
+                        raw = copy.deepcopy(INSPECTION)
+                        raw['facilityId'] = facility_id
+                        if facility_id == 'bad':
+                            raw['violations']['0'][0] = 123
+                        return [raw]
+
+                with scoped_connect(autocommit=True) as conn:
+                    db.init(conn)
+                    with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
+                         mock.patch.object(cli, 'Source', TestSource), mock.patch('sys.argv', ['etl']), \
+                         mock.patch('sys.stderr'):
+                        self.assertEqual(cli.main(), 1)
+                    status, error, count = conn.execute("SELECT status, error, (counters->>'invalid_facilities')::int FROM etl_runs ORDER BY id DESC LIMIT 1").fetchone()
+                    self.assertEqual((status, count), ('failed', 1))
+                    self.assertIn('bad', error)
+                    self.assertEqual(conn.execute('SELECT source_id FROM facilities ORDER BY source_id').fetchall(), [('good',), ('later',)])
+                    orphan = db.start(conn, {'start_page': 0})
+                    self.assertIsNone(db.cutoff(conn, orphan, dict(start_page=0, full=False, overlap_days=14)))
+                    conn.execute('SELECT pg_advisory_lock(%s)', (db.RUN_LOCK_KEY,))
+                    with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
+                         mock.patch.object(cli, 'Source', TestSource), mock.patch('sys.argv', ['etl', '--retry-report-errors']), mock.patch('sys.stderr'):
+                        self.assertEqual(cli.main(), 1)
+                    self.assertEqual(conn.execute('SELECT count(*) FROM etl_runs').fetchone()[0], 2)
+                    conn.execute('SELECT pg_advisory_unlock(%s)', (db.RUN_LOCK_KEY,))
+                    with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
+                         mock.patch.object(cli, 'Source', TestSource), mock.patch('sys.argv', ['etl', '--retry-report-errors']):
+                        self.assertEqual(cli.main(), 0)
+                    self.assertEqual(conn.execute('SELECT status, finished IS NOT NULL, error FROM etl_runs WHERE id=%s', (orphan,)).fetchone(),
+                                     ('interrupted', True, 'Process ended without finishing'))
+            finally:
+                admin.execute('DROP SCHEMA etl_run_test CASCADE')
 
     def test_ingestion_replay_and_invalid_page(self):
         class Rollback(Exception):

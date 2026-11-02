@@ -3,24 +3,37 @@ import sys
 from . import db, transform
 
 
+MIN_EXHAUSTED_PAGE_RATIO = 0.9
+
+
 def run(conn, source, run_id, options):
     if options['retry_report_errors']:
         return retry_report_errors(conn, source, run_id, options['max_reports'])
     cutoff = db.cutoff(conn, run_id, options)
     page = options['start_page']
     remaining = options['max_reports']
+    furthest = conn.execute("SELECT max(next_page) FROM etl_runs WHERE status='exhausted' AND options->>'start_page'='0'").fetchone()[0]
+    invalid = []
+    status = 'bounded'
     while options['max_pages'] is None or page - options['start_page'] < options['max_pages']:
         facilities = source.search(page)
         if not facilities:
-            return 'exhausted'
-        fetched, remaining = fetch_page(conn, source, facilities, options['reports'], remaining, options['full'])
-        ingest_page(conn, run_id, page, fetched)
+            if furthest and page < furthest * MIN_EXHAUSTED_PAGE_RATIO:
+                raise RuntimeError(f'Unexpected empty page {page}; previous exhausted run reached {furthest}')
+            status = 'exhausted'
+            break
+        fetched, remaining, skipped = fetch_page(conn, source, facilities, options['reports'], remaining, options['full'])
+        invalid.extend(skipped)
+        ingest_page(conn, run_id, page, fetched, len(skipped))
         page += 1
-        if cutoff:
+        if cutoff and not skipped:
             dates = [transform.facility(f, [0])['last_inspection_date'] for f in facilities]
             if all(date is not None and date < cutoff.isoformat() for date in dates):
-                return 'caught_up'
-    return 'bounded'
+                status = 'caught_up'
+                break
+    if invalid:
+        raise ValueError(f'{len(invalid)} invalid facilities: {", ".join(invalid[:5])}')
+    return status
 
 
 class ReportTransportError(Exception):
@@ -74,7 +87,7 @@ def retry_report_errors(conn, source, run_id, limit):
     return 'bounded'
 
 
-def ingest_page(conn, run_id, page, fetched):
+def ingest_page(conn, run_id, page, fetched, invalid_count=0):
     errors = [0]
     count_inspections = count_violations = count_reports = report_errors = 0
     with conn.transaction():
@@ -101,16 +114,24 @@ def ingest_page(conn, run_id, page, fetched):
               'inspections',COALESCE((counters->>'inspections')::int,0)+%s,
               'violations',COALESCE((counters->>'violations')::int,0)+%s,
               'parsed_reports',COALESCE((counters->>'parsed_reports')::int,0),
-              'skipped_facilities',COALESCE((counters->>'skipped_facilities')::int,0)+%s) WHERE id=%s""",
+              'skipped_facilities',COALESCE((counters->>'skipped_facilities')::int,0)+%s,
+              'invalid_facilities',COALESCE((counters->>'invalid_facilities')::int,0)+%s) WHERE id=%s""",
             (page + 1, len(fetched), count_inspections, count_violations,
-             sum(item.get('skipped', False) for item in fetched), run_id))
+             sum(item.get('skipped', False) for item in fetched), invalid_count, run_id))
         update_report_counters(conn, run_id, count_reports, report_errors, errors[0])
 
 
 def fetch_page(conn, source, facilities, reports, remaining, full):
     fetched = []
+    invalid = []
     for f in facilities:
-        facility = transform.facility(f, [0])
+        try:
+            facility = transform.facility(f, [0])
+        except ValueError as exc:
+            facility_id = str(f.get('id', '<missing>')) if isinstance(f, dict) else '<missing>'
+            print(f'Invalid facility {facility_id}: {exc}', file=sys.stderr, flush=True)
+            invalid.append(facility_id)
+            continue
         entries = []
         stored = conn.execute('SELECT raw FROM facilities WHERE source_id = %s',
                               (facility['source_id'],)).fetchone()
@@ -122,7 +143,17 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
         if unchanged and not needs_reports:
             fetched.append({'facility': f, 'inspections': entries, 'skipped': True})
             continue
-        for raw in source.inspections(facility['source_id']):
+        try:
+            inspections = source.inspections(facility['source_id'])
+            for raw in inspections:
+                transform.inspection(raw, facility['source_id'], [0])
+                for key, value in raw['violations'].items():
+                    transform.violation(key, value, [0])
+        except ValueError as exc:
+            print(f"Invalid facility {facility['source_id']}: {exc}", file=sys.stderr, flush=True)
+            invalid.append(facility['source_id'])
+            continue
+        for raw in inspections:
             entry = {'inspection': raw}
             i = transform.inspection(raw, facility['source_id'], [0])
             if reports and (remaining is None or remaining > 0):
@@ -133,4 +164,4 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
                     entry['report'] = fetch_report(source, i['printable_url'], i['report_template'])
             entries.append(entry)
         fetched.append({'facility': f, 'inspections': entries})
-    return fetched, remaining
+    return fetched, remaining, invalid

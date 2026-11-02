@@ -2,6 +2,9 @@ from pathlib import Path
 from psycopg.types.json import Jsonb
 
 
+RUN_LOCK_KEY = 0x47414845414C5448
+
+
 def init(conn):
     with conn.transaction():
         conn.execute((Path(__file__).parent.parent / 'schema.sql').read_text())

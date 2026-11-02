@@ -17,6 +17,10 @@ INSPECTIONS_REFETCH_DELAYS = (5, 30)
 UNCLOSED_SCRIPT = re.compile(rb'<script>(?=[^<]*</div>)')
 
 
+class HTTPError(RuntimeError):
+    pass
+
+
 class Source:
     def __init__(self):
         self.last_request = 0.0
@@ -36,16 +40,16 @@ class Source:
             self.last_request = time.monotonic()
             try:
                 response = self.session.get(url, timeout=30, retries=1, follow_redirects=False, discard_cookies=True)
-                if response.status >= 500:
+                if response.status == 429 or response.status >= 500:
                     raise RuntimeError(f'HTTP {response.status} for {url}')
                 if response.status != 200:
-                    raise ValueError(f'HTTP {response.status} for {url}')
+                    raise HTTPError(f'HTTP {response.status} for {url}')
                 return response
-            except ValueError:
+            except HTTPError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if attempt == 2:
-                    raise
+                    raise RuntimeError(f'Request failed for {url}: {exc}') from exc
                 time.sleep(2 ** attempt)
 
     def search(self, page):
@@ -68,7 +72,10 @@ class Source:
             print(f'Refetching inspections for {facility_id}; unexpected record: {json.dumps(mismatched[0])[:500]}',
                   file=sys.stderr, flush=True)
             time.sleep(delay)
-        return self.facility_inspections(url)
+        inspections = self.facility_inspections(url)
+        if any(not belongs_to(i, facility_id) for i in inspections):
+            raise ValueError(f'Invalid inspection id or facility for {facility_id}')
+        return inspections
 
     def report(self, url):
         response = self.get(url)
@@ -81,10 +88,17 @@ class Source:
         return [i for i in self.json(url) if not is_no_inspections_placeholder(i)]
 
     def json(self, url):
-        data = json.loads(self.get(url).body)
-        if not isinstance(data, list):
-            raise ValueError('Expected API list')
-        return data
+        for attempt in range(3):
+            response = self.get(url)
+            try:
+                data = json.loads(response.body)
+                if not isinstance(data, list):
+                    raise ValueError('Expected API list')
+                return data
+            except (ValueError, UnicodeDecodeError) as exc:
+                if attempt == 2:
+                    raise RuntimeError(f'Invalid API response for {url}: {exc}') from exc
+                time.sleep(2 ** attempt)
 
 
 def belongs_to(inspection, facility_id):
