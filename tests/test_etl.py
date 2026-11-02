@@ -1,6 +1,7 @@
 import copy
 import json
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest import mock
@@ -11,7 +12,7 @@ from scrapling.parser import Selector
 
 from ga_health_inspect import db, pipeline, transform
 from ga_health_inspect import __main__ as cli
-from ga_health_inspect.pipeline import ingest_page
+from ga_health_inspect.pipeline import fetch_page, ingest_page
 from ga_health_inspect.source import Source
 
 FACILITY = {'id': 'YWJj', 'name': 'Example', 'mapAddress': '1 Main St', 'columns': {
@@ -210,38 +211,51 @@ class LifecycleTest(unittest.TestCase):
                     run_id = db.start(conn, options)
                     with self.assertRaisesRegex(RuntimeError, 'Unexpected empty page'):
                         pipeline.run(conn, empty, run_id, options)
+                    newer = db.start(conn, options)
+                    conn.execute("UPDATE etl_runs SET status='exhausted', next_page=1 WHERE id=%s", (newer,))
+                    run_id = db.start(conn, options)
+                    empty.search = lambda page: [facilities[0]] if page == 0 else []
+                    self.assertEqual(pipeline.run(conn, empty, run_id, options), 'exhausted')
                     raise Rollback()
             except Rollback:
                 pass
 
     def test_run_reconciliation_and_invalid_facility(self):
-        connect = psycopg.connect
-        with connect(autocommit=True) as admin:
-            admin.execute('CREATE SCHEMA etl_run_test')
+        class Rollback(Exception):
+            pass
+
+        class TestSource:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def search(self, page):
+                return [[dict(FACILITY, id='bad'), dict(FACILITY, id='good')],
+                        [dict(FACILITY, id='later')], []][page]
+
+            def inspections(self, facility_id):
+                raw = copy.deepcopy(INSPECTION)
+                raw['facilityId'] = facility_id
+                if facility_id == 'bad':
+                    raw['violations']['0'][0] = 123
+                return [raw]
+
+        with psycopg.connect(autocommit=True) as conn, psycopg.connect(autocommit=True) as lock_conn:
             try:
-                def scoped_connect(**kwargs):
-                    return connect(options='-c search_path=etl_run_test', **kwargs)
-
-                class TestSource:
-                    def __enter__(self):
-                        return self
-
-                    def __exit__(self, *args):
-                        pass
-
-                    def search(self, page):
-                        return [[dict(FACILITY, id='bad'), dict(FACILITY, id='good')],
-                                [dict(FACILITY, id='later')], []][page]
-
-                    def inspections(self, facility_id):
-                        raw = copy.deepcopy(INSPECTION)
-                        raw['facilityId'] = facility_id
-                        if facility_id == 'bad':
-                            raw['violations']['0'][0] = 123
-                        return [raw]
-
-                with scoped_connect(autocommit=True) as conn:
+                with conn.transaction():
+                    conn.execute('CREATE SCHEMA etl_run_test')
+                    conn.execute('SET LOCAL search_path TO etl_run_test')
                     db.init(conn)
+
+                    @contextmanager
+                    def scoped_connect(**kwargs):
+                        try:
+                            yield conn
+                        finally:
+                            conn.execute('SELECT pg_advisory_unlock(%s)', (db.RUN_LOCK_KEY,))
+
                     with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
                          mock.patch.object(cli, 'Source', TestSource), mock.patch('sys.argv', ['etl']), \
                          mock.patch('sys.stderr'):
@@ -252,19 +266,21 @@ class LifecycleTest(unittest.TestCase):
                     self.assertEqual(conn.execute('SELECT source_id FROM facilities ORDER BY source_id').fetchall(), [('good',), ('later',)])
                     orphan = db.start(conn, {'start_page': 0})
                     self.assertIsNone(db.cutoff(conn, orphan, dict(start_page=0, full=False, overlap_days=14)))
-                    conn.execute('SELECT pg_advisory_lock(%s)', (db.RUN_LOCK_KEY,))
+                    self.assertTrue(lock_conn.execute('SELECT pg_try_advisory_lock(%s)', (db.RUN_LOCK_KEY,)).fetchone()[0])
                     with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
                          mock.patch.object(cli, 'Source', TestSource), mock.patch('sys.argv', ['etl', '--retry-report-errors']), mock.patch('sys.stderr'):
                         self.assertEqual(cli.main(), 1)
                     self.assertEqual(conn.execute('SELECT count(*) FROM etl_runs').fetchone()[0], 2)
-                    conn.execute('SELECT pg_advisory_unlock(%s)', (db.RUN_LOCK_KEY,))
+                    self.assertEqual(conn.execute('SELECT status FROM etl_runs WHERE id=%s', (orphan,)).fetchone()[0], 'running')
+                    lock_conn.execute('SELECT pg_advisory_unlock(%s)', (db.RUN_LOCK_KEY,))
                     with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
                          mock.patch.object(cli, 'Source', TestSource), mock.patch('sys.argv', ['etl', '--retry-report-errors']):
                         self.assertEqual(cli.main(), 0)
                     self.assertEqual(conn.execute('SELECT status, finished IS NOT NULL, error FROM etl_runs WHERE id=%s', (orphan,)).fetchone(),
                                      ('interrupted', True, 'Process ended without finishing'))
-            finally:
-                admin.execute('DROP SCHEMA etl_run_test CASCADE')
+                    raise Rollback()
+            except Rollback:
+                pass
 
     def test_ingestion_replay_and_invalid_page(self):
         class Rollback(Exception):
@@ -283,7 +299,7 @@ class LifecycleTest(unittest.TestCase):
         facility = copy.deepcopy(FACILITY)
         inspection = copy.deepcopy(INSPECTION)
         fields = parsed
-        fetched = [{'facility': facility, 'inspections': [{'inspection': inspection, 'report': (fields, raw, errors[0])}]}]
+        source = SimpleNamespace(inspections=lambda facility_id: [inspection])
         with psycopg.connect(autocommit=True) as conn:
             try:
                 with conn.transaction():
@@ -291,37 +307,32 @@ class LifecycleTest(unittest.TestCase):
                     conn.execute('SET LOCAL search_path TO etl_lifecycle_test')
                     db.init(conn)
                     run = db.start(conn, {'start_page': 0})
-                    ingest_page(conn, run, 0, fetched)
+                    fetched, _, _ = fetch_page(conn, source, [facility], False, None, True)
+                    fetched[0]['inspections'][0]['report'] = (fields, raw, errors[0])
+                    ingest_page(conn, run, 0, fetched, 0)
                     self.assertEqual(conn.execute('SELECT name, permit_number, last_inspection_date::text FROM facilities').fetchone(), ('Example', 'F-1', '2024-01-02'))
                     self.assertEqual(conn.execute('SELECT inspection_date::text, score, report_fields, report_raw FROM inspections').fetchone(), (None, 90, fields, raw))
                     self.assertEqual(conn.execute("SELECT (counters->>'parsed_reports')::int, conversion_errors FROM etl_runs WHERE id=%s", (run,)).fetchone(), (1, 2))
                     self.assertEqual(conn.execute('SELECT code_title, points, corrected, repeat, notes FROM violations').fetchone(), ('1. Item', 2, True, False, 'Fix'))
                     replay = copy.deepcopy(fetched)
                     del replay[0]['inspections'][0]['report']
-                    ingest_page(conn, run, 0, replay)
+                    ingest_page(conn, run, 0, replay, 0)
                     self.assertEqual(conn.execute('SELECT (SELECT count(*) FROM facilities), (SELECT count(*) FROM inspections), (SELECT count(*) FROM violations)').fetchone(), (1, 1, 1))
                     self.assertEqual(conn.execute('SELECT report_fields FROM inspections').fetchone()[0], fields)
                     old_hash = conn.execute('SELECT violations_hash FROM inspections').fetchone()[0]
-                    replay[0]['inspections'][0]['inspection']['violations']['0'][2] = 'Points: 3'
-                    ingest_page(conn, run, 0, replay)
+                    inspection['violations']['0'][2] = 'Points: 3'
+                    replay, _, _ = fetch_page(conn, source, [facility], False, None, True)
+                    ingest_page(conn, run, 0, replay, 0)
                     new_hash = conn.execute('SELECT violations_hash FROM inspections').fetchone()[0]
                     self.assertNotEqual(old_hash, new_hash)
                     self.assertEqual(conn.execute('SELECT snapshot_hash, points FROM violations ORDER BY points').fetchall(), [(old_hash, 2), (new_hash, 3)])
                     replay[0]['inspections'][0]['report'] = RuntimeError('x')
-                    ingest_page(conn, run, 0, replay)
+                    ingest_page(conn, run, 0, replay, 0)
                     self.assertEqual(conn.execute('SELECT report_error FROM inspections').fetchone()[0], 'RuntimeError: x')
                     self.assertEqual(conn.execute('SELECT report_errors FROM etl_runs WHERE id=%s', (run,)).fetchone()[0], 1)
                     replay[0]['inspections'][0]['report'] = (fields, raw, errors[0])
-                    ingest_page(conn, run, 0, replay)
+                    ingest_page(conn, run, 0, replay, 0)
                     self.assertIsNone(conn.execute('SELECT report_error FROM inspections').fetchone()[0])
-                    invalid = copy.deepcopy(replay)
-                    invalid[0]['facility']['name'] = 'Must roll back'
-                    invalid[0]['inspections'][0]['inspection']['inspectionId'] = None
-                    with self.assertRaises(ValueError):
-                        ingest_page(conn, run, 1, invalid)
-                    self.assertEqual(conn.execute('SELECT next_page FROM etl_runs WHERE id=%s', (run,)).fetchone()[0], 1)
-                    self.assertEqual(conn.execute('SELECT count(*) FROM inspections').fetchone()[0], 1)
-                    self.assertEqual(conn.execute('SELECT name FROM facilities').fetchone()[0], 'Example')
                     raise Rollback()
             except Rollback:
                 pass

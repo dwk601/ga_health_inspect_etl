@@ -95,7 +95,7 @@ class Source:
                 if not isinstance(data, list):
                     raise ValueError('Expected API list')
                 return data
-            except (ValueError, UnicodeDecodeError) as exc:
+            except ValueError as exc:
                 if attempt == 2:
                     raise RuntimeError(f'Invalid API response for {url}: {exc}') from exc
                 time.sleep(2 ** attempt)

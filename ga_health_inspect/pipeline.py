@@ -12,27 +12,30 @@ def run(conn, source, run_id, options):
     cutoff = db.cutoff(conn, run_id, options)
     page = options['start_page']
     remaining = options['max_reports']
-    furthest = conn.execute("SELECT max(next_page) FROM etl_runs WHERE status='exhausted' AND options->>'start_page'='0'").fetchone()[0]
-    invalid = []
+    previous = conn.execute("""SELECT next_page FROM etl_runs
+        WHERE status='exhausted' AND options->>'start_page'='0'
+        ORDER BY started DESC, id DESC LIMIT 1""").fetchone()
+    previous_end = previous[0] if previous else None
+    invalid_ids = []
     status = 'bounded'
     while options['max_pages'] is None or page - options['start_page'] < options['max_pages']:
         facilities = source.search(page)
         if not facilities:
-            if furthest and page < furthest * MIN_EXHAUSTED_PAGE_RATIO:
-                raise RuntimeError(f'Unexpected empty page {page}; previous exhausted run reached {furthest}')
+            if previous_end and page < previous_end * MIN_EXHAUSTED_PAGE_RATIO:
+                raise RuntimeError(f'Unexpected empty page {page}; previous exhausted run reached {previous_end}')
             status = 'exhausted'
             break
-        fetched, remaining, skipped = fetch_page(conn, source, facilities, options['reports'], remaining, options['full'])
-        invalid.extend(skipped)
-        ingest_page(conn, run_id, page, fetched, len(skipped))
+        fetched, remaining, invalid = fetch_page(conn, source, facilities, options['reports'], remaining, options['full'])
+        invalid_ids.extend(invalid)
+        ingest_page(conn, run_id, page, fetched, len(invalid))
         page += 1
-        if cutoff and not skipped:
-            dates = [transform.facility(f, [0])['last_inspection_date'] for f in facilities]
+        if cutoff and not invalid:
+            dates = [item['facility']['last_inspection_date'] for item in fetched]
             if all(date is not None and date < cutoff.isoformat() for date in dates):
                 status = 'caught_up'
                 break
-    if invalid:
-        raise ValueError(f'{len(invalid)} invalid facilities: {", ".join(invalid[:5])}')
+    if invalid_ids:
+        raise ValueError(f'{len(invalid_ids)} invalid facilities: {", ".join(invalid_ids[:5])}')
     return status
 
 
@@ -87,20 +90,19 @@ def retry_report_errors(conn, source, run_id, limit):
     return 'bounded'
 
 
-def ingest_page(conn, run_id, page, fetched, invalid_count=0):
+def ingest_page(conn, run_id, page, fetched, invalid_count):
     errors = [0]
     count_inspections = count_violations = count_reports = report_errors = 0
     with conn.transaction():
         for item in fetched:
-            f = transform.facility(item['facility'], errors)
+            f = item['facility']
+            errors[0] += item['conversion_errors']
             db.upsert(conn, 'facilities', f, ('source_id',))
             for entry in item['inspections']:
-                raw = entry['inspection']
-                i = transform.inspection(raw, f['source_id'], errors)
+                i = entry['inspection']
                 db.upsert(conn, 'inspections', i, ('facility_id', 'source_id'))
                 count_inspections += 1
-                for key, value in raw['violations'].items():
-                    v = transform.violation(key, value, errors)
+                for v in entry['violations']:
                     v.update(facility_id=f['source_id'], inspection_id=i['source_id'], snapshot_hash=i['violations_hash'])
                     db.upsert(conn, 'violations', v, ('facility_id', 'inspection_id', 'snapshot_hash', 'source_key'))
                     count_violations += 1
@@ -125,8 +127,9 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
     fetched = []
     invalid = []
     for f in facilities:
+        errors = [0]
         try:
-            facility = transform.facility(f, [0])
+            facility = transform.facility(f, errors)
         except ValueError as exc:
             facility_id = str(f.get('id', '<missing>')) if isinstance(f, dict) else '<missing>'
             print(f'Invalid facility {facility_id}: {exc}', file=sys.stderr, flush=True)
@@ -141,27 +144,25 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
                              WHERE facility_id = %s AND report_fields IS NULL AND report_error IS NULL)''',
                                           (facility['source_id'],)).fetchone()[0])
         if unchanged and not needs_reports:
-            fetched.append({'facility': f, 'inspections': entries, 'skipped': True})
+            fetched.append({'facility': facility, 'inspections': entries, 'skipped': True, 'conversion_errors': errors[0]})
             continue
         try:
             inspections = source.inspections(facility['source_id'])
             for raw in inspections:
-                transform.inspection(raw, facility['source_id'], [0])
-                for key, value in raw['violations'].items():
-                    transform.violation(key, value, [0])
+                inspection = transform.inspection(raw, facility['source_id'], errors)
+                violations = [transform.violation(key, value, errors) for key, value in raw['violations'].items()]
+                entries.append({'inspection': inspection, 'violations': violations})
         except ValueError as exc:
             print(f"Invalid facility {facility['source_id']}: {exc}", file=sys.stderr, flush=True)
             invalid.append(facility['source_id'])
             continue
-        for raw in inspections:
-            entry = {'inspection': raw}
-            i = transform.inspection(raw, facility['source_id'], [0])
+        for entry in entries:
+            i = entry['inspection']
             if reports and (remaining is None or remaining > 0):
                 stored_report = conn.execute('SELECT report_fields IS NOT NULL OR report_error IS NOT NULL FROM inspections WHERE facility_id=%s AND source_id=%s', (i['facility_id'], i['source_id'])).fetchone()
                 if not (stored_report and stored_report[0]):
                     if remaining is not None:
                         remaining -= 1
                     entry['report'] = fetch_report(source, i['printable_url'], i['report_template'])
-            entries.append(entry)
-        fetched.append({'facility': f, 'inspections': entries})
+        fetched.append({'facility': facility, 'inspections': entries, 'conversion_errors': errors[0]})
     return fetched, remaining, invalid

@@ -40,11 +40,11 @@ def main():
         parser.error('--max-reports requires --reports or --retry-report-errors')
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     with psycopg.connect(autocommit=True) as conn:
-        if not conn.execute('SELECT pg_try_advisory_lock(%s)', (db.RUN_LOCK_KEY,)).fetchone()[0]:
+        if not db.try_run_lock(conn):
             print('Another ETL run holds the advisory lock', file=sys.stderr)
             return 1
         db.init(conn)
-        conn.execute("UPDATE etl_runs SET status='interrupted', finished=now(), error='Process ended without finishing' WHERE status='running'")
+        db.reconcile_runs(conn)
         run_id = db.start(conn, vars(args))
         try:
             with Source() as source:

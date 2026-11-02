@@ -5,6 +5,14 @@ from psycopg.types.json import Jsonb
 RUN_LOCK_KEY = 0x47414845414C5448
 
 
+def try_run_lock(conn):
+    return conn.execute('SELECT pg_try_advisory_lock(%s)', (RUN_LOCK_KEY,)).fetchone()[0]
+
+
+def reconcile_runs(conn):
+    conn.execute("UPDATE etl_runs SET status='interrupted', finished=now(), error='Process ended without finishing' WHERE status='running'")
+
+
 def init(conn):
     with conn.transaction():
         conn.execute((Path(__file__).parent.parent / 'schema.sql').read_text())
