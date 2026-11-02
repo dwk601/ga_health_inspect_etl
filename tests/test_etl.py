@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from scrapling.parser import Selector
 
-from ga_health_inspect import db, pipeline, transform
+from ga_health_inspect import db, pipeline, transform, __main__
 from ga_health_inspect.pipeline import ingest_page
 from ga_health_inspect.source import Source
 
@@ -38,13 +38,16 @@ class SourceTest(unittest.TestCase):
             <div id="div_finalScore">100</div><div id="div_grade">A</div>'''
         pool = b'''<table><tr><td><b>Facility Name:</b> Example</td></tr>
             <tr><td><b>Inspection Date:</b> 01/30/2026</td></tr>%s</table>'''
-        legacy = b'''<table><tr><td></td><td>Name of Facility</td><td>Address</td><td>City</td></tr>
+        legacy = b'''<table><tr><td></td><td>&nbsp;Name of Facility</td><td>&nbsp;Address</td><td>City</td></tr>
             <tr><td></td><td>Example</td><td>1 Main</td><td>Atlanta</td></tr>
-            <tr><td>Permit No.</td></tr><tr><td>P-1</td></tr>
-            <tr><td></td><td>Date of Inspection</td></tr><tr><td></td><td>01/30/2026</td></tr></table>'''
-        cases = [('food_2015', food, ('100', 'A')), ('pool_2017', pool % b'<tr><td class="ArialEighteen" rowspan="2"><strong></strong></td></tr>', (None, None)),
-                 ('pool_2017', pool % b'<tr><td class="ArialEighteen" rowspan="2"><strong><html><hea</strong></td></tr>', (None, None)),
-                 ('Pool', legacy, (None, None)), ('pool_2017', pool % b'', None)]
+            <tr><td>&nbsp;Permit No.</td></tr><tr><td>P-1</td></tr>
+            <tr><td></td><td>&nbsp;Date of Inspection</td></tr><tr><td></td><td>01/30/2026</td></tr></table>'''
+        cases = [('food_2015', food, {'score': '100', 'grade': 'A'}),
+                 ('food_2015', food.replace(b'>100</div>', b'> </div>'), {'score': None, 'grade': 'A'}),
+                 ('pool_2017', pool % b'<tr><td class="ArialEighteen" rowspan="2"><strong></strong></td></tr>', {'score': None, 'grade': None}),
+                 ('pool_2017', pool % b'<tr><td class="ArialEighteen" rowspan="2"><strong><html><hea</strong></td></tr>', {'score': None, 'grade': None}),
+                 ('Pool', legacy, {'score': None, 'grade': None, 'address': '1 Main', 'city': 'Atlanta', 'permit_number': 'P-1'}),
+                 ('pool_2017', pool % b'', None)]
         cases += [(template, b'<html>garbage</html>', None) for template in ('food_2015', 'pool_2017', 'Pool', 'Tourist2014')]
         for template, body, expected in cases:
             with self.subTest(template=template, body=body):
@@ -56,9 +59,18 @@ class SourceTest(unittest.TestCase):
                         transform.report(page, template, [0])
                 else:
                     fields, raw = transform.report(page, template, [0])
-                    self.assertEqual((fields['name'], fields['inspection_date'], fields['score'], fields['grade']), ('Example', '2026-01-30', *expected))
-                    if template == 'Pool':
-                        self.assertEqual((fields['address'], fields['city'], fields['permit_number']), ('1 Main', 'Atlanta', 'P-1'))
+                    self.assertEqual((fields['name'], fields['inspection_date']), ('Example', '2026-01-30'))
+                    self.assertEqual({key: fields[key] for key in expected}, expected)
+        source.session = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(status=200, body=b'<title>Page Temporarily Unavailable</title>', encoding='utf-8'))
+        with self.assertRaises(RuntimeError):
+            source.report('https://example.test/r')
+
+    def test_retry_cli_rejects_search_options(self):
+        for option in (['--reports'], ['--full'], ['--start-page', '0'], ['--max-pages', '1']):
+            with self.subTest(option=option), mock.patch('sys.argv', ['etl', '--retry-report-errors', *option]), mock.patch('sys.stderr'):
+                with self.assertRaises(SystemExit) as error:
+                    __main__.main()
+                self.assertEqual(error.exception.code, 2)
 
     def test_inspections_normalize_source_quirks(self):
         placeholder = {'printablePath': '', 'inspectionId': 0, 'facilityId': 'YWJj',
@@ -111,7 +123,7 @@ class LifecycleTest(unittest.TestCase):
                     <tr><td><b>Inspection Date:</b> 01/02/2024</td></tr></table>
                     <div id="div_finalScore">90</div>''')
 
-        options = dict(start_page=0, max_pages=1, full=False, overlap_days=14, reports=False, max_reports=None)
+        options = dict(start_page=0, max_pages=1, full=False, overlap_days=14, reports=False, max_reports=None, retry_report_errors=False)
         with psycopg.connect(autocommit=True) as conn:
             try:
                 with conn.transaction():
@@ -147,17 +159,29 @@ class LifecycleTest(unittest.TestCase):
                     source = Source()
                     execute(source)
                     self.assertEqual((source.requests, source.reports), (['A'], []))
+                    conn.execute("UPDATE inspections SET report_fetched_at=now()-interval '2 days' WHERE facility_id='A'")
+                    conn.execute("UPDATE inspections SET report_error='newer error', report_fetched_at=now()-interval '1 day', printable_url=printable_url || '&facility=B' WHERE facility_id='B'")
                     options['retry_report_errors'] = True
                     source = Source()
                     retry_id, status = execute(source)
                     self.assertEqual((status, source.searches, source.requests, len(source.reports)), ('bounded', [], [], 1))
+                    self.assertFalse(source.reports[0].endswith('&facility=B'))
                     self.assertEqual(conn.execute("SELECT report_error, report_fields->>'score' FROM inspections WHERE facility_id='A'").fetchone(), (None, '90'))
-                    self.assertEqual(db.cutoff(conn, retry_id, options), today - timedelta(days=14))
+                    self.assertEqual(conn.execute("SELECT report_error FROM inspections WHERE facility_id='B'").fetchone()[0], 'newer error')
+                    source = Source()
+                    source.fail_report = True
+                    with mock.patch('sys.stderr'):
+                        retry_id, _ = execute(source)
+                    self.assertEqual(conn.execute("SELECT report_error, report_fetched_at=now() FROM inspections WHERE facility_id='B'").fetchone(), ('newer error', True))
+                    self.assertEqual(conn.execute('SELECT report_errors FROM etl_runs WHERE id=%s', (retry_id,)).fetchone()[0], 1)
+                    conn.execute("UPDATE inspections SET report_error=NULL WHERE facility_id='B'")
                     options.update(retry_report_errors=False, start_page=1)
                     source = Source()
                     source.fail_report = True
                     with mock.patch('sys.stderr'):
-                        self.assertEqual(execute(source)[1], 'bounded')
+                        failed_id, status = execute(source)
+                    self.assertEqual(status, 'bounded')
+                    self.assertEqual(conn.execute('SELECT report_errors FROM etl_runs WHERE id=%s', (failed_id,)).fetchone()[0], 1)
                     self.assertEqual(len(source.reports), 1)
                     self.assertEqual(conn.execute("SELECT report_error, report_fields FROM inspections WHERE facility_id='B'").fetchone(), (None, None))
                     source = Source()

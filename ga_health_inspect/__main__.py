@@ -23,7 +23,7 @@ def positive(value):
 
 def main():
     parser = argparse.ArgumentParser(description='Load Georgia health inspections')
-    parser.add_argument('--start-page', type=nonnegative, default=0)
+    parser.add_argument('--start-page', type=nonnegative)
     parser.add_argument('--max-pages', type=nonnegative)
     parser.add_argument('--full', action='store_true')
     parser.add_argument('--overlap-days', type=nonnegative, default=14)
@@ -31,6 +31,10 @@ def main():
     parser.add_argument('--retry-report-errors', action='store_true')
     parser.add_argument('--max-reports', type=positive)
     args = parser.parse_args()
+    if args.retry_report_errors and (args.reports or args.full or args.start_page is not None or args.max_pages is not None):
+        parser.error('--retry-report-errors cannot be combined with --reports, --full, --start-page or --max-pages')
+    if args.start_page is None:
+        args.start_page = 0
     if args.max_reports is not None and not (args.reports or args.retry_report_errors):
         parser.error('--max-reports requires --reports or --retry-report-errors')
     with psycopg.connect(autocommit=True) as conn:

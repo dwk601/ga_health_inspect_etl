@@ -72,6 +72,8 @@ class Source:
 
     def report(self, url):
         response = self.get(url)
+        if b'<title>Page Temporarily Unavailable</title>' in response.body:
+            raise RuntimeError(f'Report page temporarily unavailable: {url}')
         return Selector(UNCLOSED_SCRIPT.sub(b'', response.body), url=url, encoding=response.encoding)
 
     def facility_inspections(self, url):

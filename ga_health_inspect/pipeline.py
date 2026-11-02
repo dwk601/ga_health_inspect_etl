@@ -4,7 +4,7 @@ from . import db, transform
 
 
 def run(conn, source, run_id, options):
-    if options.get('retry_report_errors'):
+    if options['retry_report_errors']:
         return retry_report_errors(conn, source, run_id, options['max_reports'])
     cutoff = db.cutoff(conn, run_id, options)
     page = options['start_page']
@@ -23,18 +23,43 @@ def run(conn, source, run_id, options):
     return 'bounded'
 
 
+class ReportTransportError(Exception):
+    pass
+
+
 def fetch_report(source, url, template):
     try:
         page = source.report(url)
     except Exception as exc:
         print(f'Report fetch failed for {url}: {exc}', file=sys.stderr, flush=True)
-        return None
+        return ReportTransportError(str(exc))
     try:
         conversions = [0]
         fields, raw = transform.report(page, template, conversions)
         return fields, raw, conversions[0]
     except Exception as exc:
         return exc
+
+
+def save_report_result(conn, facility_id, inspection_id, result):
+    if isinstance(result, ReportTransportError):
+        conn.execute('UPDATE inspections SET report_fetched_at=now() WHERE facility_id=%s AND source_id=%s',
+                     (facility_id, inspection_id))
+        return 0, 1, 0
+    if isinstance(result, Exception):
+        db.save_report_error(conn, facility_id, inspection_id, result)
+        return 0, 1, 0
+    fields, raw, conversions = result
+    db.save_report(conn, facility_id, inspection_id, fields, raw)
+    return 1, 0, conversions
+
+
+def update_report_counters(conn, run_id, parsed, failures, conversions):
+    conn.execute('''UPDATE etl_runs SET report_errors=report_errors+%s,
+        conversion_errors=conversion_errors+%s,
+        counters=jsonb_set(counters, '{parsed_reports}',
+        to_jsonb(COALESCE((counters->>'parsed_reports')::int,0)+%s), true) WHERE id=%s''',
+                 (failures, conversions, parsed, run_id))
 
 
 def retry_report_errors(conn, source, run_id, limit):
@@ -44,16 +69,8 @@ def retry_report_errors(conn, source, run_id, limit):
     for facility_id, inspection_id, url, template in rows:
         result = fetch_report(source, url, template)
         with conn.transaction():
-            if isinstance(result, Exception):
-                db.save_report_error(conn, facility_id, inspection_id, result)
-                conn.execute('UPDATE etl_runs SET report_errors=report_errors+1 WHERE id=%s', (run_id,))
-            elif result is not None:
-                fields, raw, conversions = result
-                db.save_report(conn, facility_id, inspection_id, fields, raw)
-                conn.execute('''UPDATE etl_runs SET conversion_errors=conversion_errors+%s,
-                    counters=jsonb_set(counters, '{parsed_reports}',
-                    to_jsonb(COALESCE((counters->>'parsed_reports')::int,0)+1), true) WHERE id=%s''',
-                             (conversions, run_id))
+            counts = save_report_result(conn, facility_id, inspection_id, result)
+            update_report_counters(conn, run_id, *counts)
     return 'bounded'
 
 
@@ -75,24 +92,19 @@ def ingest_page(conn, run_id, page, fetched):
                     db.upsert(conn, 'violations', v, ('facility_id', 'inspection_id', 'snapshot_hash', 'source_key'))
                     count_violations += 1
                 if 'report' in entry:
-                    result = entry['report']
-                    if isinstance(result, Exception):
-                        report_errors += 1
-                        db.save_report_error(conn, f['source_id'], i['source_id'], result)
-                    else:
-                        fields, raw_header, report_conversions = result
-                        errors[0] += report_conversions
-                        db.save_report(conn, f['source_id'], i['source_id'], fields, raw_header)
-                        count_reports += 1
+                    parsed, failures, conversions = save_report_result(conn, f['source_id'], i['source_id'], entry['report'])
+                    count_reports += parsed
+                    report_errors += failures
+                    errors[0] += conversions
         conn.execute("""UPDATE etl_runs SET next_page=%s,
             counters=jsonb_build_object('facilities',COALESCE((counters->>'facilities')::int,0)+%s,
               'inspections',COALESCE((counters->>'inspections')::int,0)+%s,
               'violations',COALESCE((counters->>'violations')::int,0)+%s,
-              'parsed_reports',COALESCE((counters->>'parsed_reports')::int,0)+%s,
-              'skipped_facilities',COALESCE((counters->>'skipped_facilities')::int,0)+%s),
-            conversion_errors=conversion_errors+%s, report_errors=report_errors+%s WHERE id=%s""",
-            (page + 1, len(fetched), count_inspections, count_violations, count_reports,
-             sum(item.get('skipped', False) for item in fetched), errors[0], report_errors, run_id))
+              'parsed_reports',COALESCE((counters->>'parsed_reports')::int,0),
+              'skipped_facilities',COALESCE((counters->>'skipped_facilities')::int,0)+%s) WHERE id=%s""",
+            (page + 1, len(fetched), count_inspections, count_violations,
+             sum(item.get('skipped', False) for item in fetched), run_id))
+        update_report_counters(conn, run_id, count_reports, report_errors, errors[0])
 
 
 def fetch_page(conn, source, facilities, reports, remaining, full):
@@ -118,9 +130,7 @@ def fetch_page(conn, source, facilities, reports, remaining, full):
                 if not (stored_report and stored_report[0]):
                     if remaining is not None:
                         remaining -= 1
-                    result = fetch_report(source, i['printable_url'], i['report_template'])
-                    if result is not None:
-                        entry['report'] = result
+                    entry['report'] = fetch_report(source, i['printable_url'], i['report_template'])
             entries.append(entry)
         fetched.append({'facility': f, 'inspections': entries})
     return fetched, remaining

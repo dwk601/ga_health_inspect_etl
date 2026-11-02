@@ -124,6 +124,8 @@ def food_report(page):
     grades = page.css('#div_grade::text').getall()
     raw['score'] = scores[0].strip() if scores else None
     raw['grade'] = grades[0].strip() if grades else None
+    if raw['score'] is None:
+        raise ValueError('Report score not recognized')
     return raw
 
 
@@ -134,7 +136,8 @@ def pool_report(page):
     if not containers:
         raise ValueError('Report score container not recognized')
     scores = containers[0].xpath('./text()').getall()
-    raw.update(score=scores[0].strip() or None if scores else None, grade=None)
+    score = scores[0].strip() if scores else ''
+    raw.update(score=score or None, grade=None)
     return raw
 
 
@@ -149,6 +152,8 @@ def tourist_report(page):
                 raw[key] = f'{raw[key]} {suffix.strip()}'.strip()
     scores = page.xpath('//td[contains(@style,"font-size:40pt")]/text()').getall()
     raw.update(score=scores[0].strip() if scores else None, grade=None)
+    if raw['score'] is None:
+        raise ValueError('Report score not recognized')
     return raw
 
 
@@ -156,17 +161,13 @@ def legacy_pool_report(page):
     raw = {}
     for key, label in [('name', 'Name of Facility'), ('address', 'Address'), ('city', 'City'),
                        ('permit_number', 'Permit No.'), ('inspection_date', 'Date of Inspection')]:
+        cells = page.xpath('//tr/*[self::td or self::th][normalize-space(translate(., "\u00a0", " "))=$label]', label=label)
         raw[key] = None
-        for row in page.xpath('//tr'):
-            cells = row.xpath('./td|./th')
-            for index, cell in enumerate(cells):
-                if text(cell) == label:
-                    following = row.xpath('./following-sibling::tr[1]/*[self::td or self::th]')
-                    if index < len(following):
-                        raw[key] = text(following[index]) or None
-                    break
-            if raw[key]:
-                break
+        if cells:
+            index = len(cells[0].xpath('./preceding-sibling::*[self::td or self::th]'))
+            values = cells[0].xpath('../following-sibling::tr[1]/*[self::td or self::th]')
+            if index < len(values):
+                raw[key] = text(values[index]) or None
     raw.update(score=None, grade=None, time_in=None, time_out=None)
     return raw
 
@@ -179,7 +180,7 @@ def report(page, template, errors):
     if template not in REPORT_EXTRACTORS:
         raise ValueError('Unknown report template: ' + template)
     raw = REPORT_EXTRACTORS[template](page)
-    if not raw['name'] or not raw['inspection_date'] or (template not in ('Pool', 'pool_2017') and not raw['score']):
+    if not raw['name'] or not raw['inspection_date']:
         raise ValueError('Report header not recognized')
     fields = dict(raw)
     fields['inspection_date'] = date(raw['inspection_date'], '%m/%d/%Y', errors)
