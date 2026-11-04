@@ -22,7 +22,8 @@ class HTTPError(RuntimeError):
 
 
 class Source:
-    def __init__(self):
+    def __init__(self, request_interval=0.5):
+        self.request_interval = request_interval
         self.last_request = 0.0
         self.session_manager = FetcherSession()
 
@@ -48,8 +49,8 @@ class Source:
 
     def request(self, method, url, **kwargs):
         for attempt in range(3):
-            # Space request starts 0.5s apart: at most 2 requests/second, without idling after slow responses.
-            time.sleep(max(0, 0.5 - (time.monotonic() - self.last_request)))
+            # Space request starts evenly (default 2 requests/second), without idling after slow responses.
+            time.sleep(max(0, self.request_interval - (time.monotonic() - self.last_request)))
             self.last_request = time.monotonic()
             try:
                 response = getattr(self.session, method)(url, timeout=30, retries=1, follow_redirects=False,

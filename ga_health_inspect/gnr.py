@@ -21,6 +21,8 @@ FIRST_DATE = date(2024, 10, 1)  # The site returns nothing earlier.
 PAGE_SIZE = 25
 MAX_START = 200
 FACILITY_PREFIX = 'gnr:'
+# The site's load balancer returned 403 to every request after ~700 requests in 5 minutes at 2/second.
+REQUEST_INTERVAL = 1.5
 REQUIRED_FIELDS = ('permitID', 'inspectionID', 'inspectionDate', 'establishmentName')
 
 

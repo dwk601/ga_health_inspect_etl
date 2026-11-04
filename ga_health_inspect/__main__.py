@@ -52,7 +52,7 @@ def main():
         db.reconcile_runs(conn)
         run_id = db.start(conn, vars(args))
         try:
-            with Source() as source:
+            with Source(gnr.REQUEST_INTERVAL) if args.gnr else Source() as source:
                 status = (gnr.run if args.gnr else pipeline.run)(conn, source, run_id, vars(args))
             db.finish(conn, run_id, status)
             return 0
