@@ -22,7 +22,7 @@ def init(conn):
 def start(conn, options):
     with conn.transaction():
         return conn.execute('INSERT INTO etl_runs (status, options, next_page) VALUES (%s,%s,%s) RETURNING id',
-                            ('running', Jsonb(options), options['start_page'])).fetchone()[0]
+                            ('running', Jsonb(options), options['start_page'] or 0)).fetchone()[0]
 
 
 def cutoff(conn, run_id, options):

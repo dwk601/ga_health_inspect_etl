@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from scrapling.parser import Selector
 
-from ga_health_inspect import db, pipeline, transform
+from ga_health_inspect import db, gnr, pipeline, transform
 from ga_health_inspect import __main__ as cli
 from ga_health_inspect.pipeline import fetch_page, ingest_page
 from ga_health_inspect.source import Source
@@ -68,7 +68,7 @@ class SourceTest(unittest.TestCase):
             source.report('https://example.test/r')
 
     def test_retry_cli_rejects_search_options(self):
-        for option in (['--reports'], ['--full'], ['--start-page', '0'], ['--max-pages', '1']):
+        for option in (['--reports'], ['--full'], ['--start-page', '0'], ['--max-pages', '1'], ['--gnr']):
             with self.subTest(option=option), mock.patch('sys.argv', ['etl', '--retry-report-errors', *option]), mock.patch('sys.stderr'):
                 with self.assertRaises(SystemExit) as error:
                     cli.main()
@@ -295,6 +295,79 @@ class LifecycleTest(unittest.TestCase):
                         self.assertEqual(cli.main(), 0)
                     self.assertEqual(conn.execute('SELECT status, finished IS NOT NULL, error FROM etl_runs WHERE id=%s', (orphan,)).fetchone(),
                                      ('interrupted', True, 'Process ended without finishing'))
+                    raise Rollback()
+            except Rollback:
+                pass
+
+    def test_gnr_incremental_load(self):
+        class Rollback(Exception):
+            pass
+
+        today = datetime.now(ZoneInfo('America/New_York')).date()
+        day = (today - timedelta(days=2)).isoformat()
+        rows = [{'permitID': f'P{i}', 'inspectionID': f'I{i}', 'inspectionDate': day + 'T00:00:00.000Z',
+                 'establishmentName': f'Place {i} ', 'addressLine1': '1 Main St', 'addressLine2': '', 'city': 'Lilburn',
+                 'state': 'GA', 'zip': '30047', 'score': 90, 'scoreDisplay': 'A', 'timein': '1899-12-30T11:05:00.000Z'}
+                for i in range(26)]
+        page = b'''<h3 class="observations-header">Observations &amp; Corrective Actions</h3><p class="observations-text">
+            4-2B: Mold &amp; dirt<br />Corrective Actions: Cleaned<br /><br />13A: Not posted<br /><br /></p>'''
+
+        class Source:
+            def __init__(self):
+                self.days = []
+                self.pages = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def post_json(self, url, body):
+                data = body['data']
+                self.days.append(data['filters']['date'].split(' to ')[0])
+                found = rows if data['filters'] == dict(data['filters'], date=f'{day} to {day}', county='gcg') else []
+                return found[data['start']:data['start'] + data['count']]
+
+            def get(self, url):
+                self.pages.append(url)
+                return SimpleNamespace(body=page)
+
+        with psycopg.connect(autocommit=True) as conn:
+            try:
+                with conn.transaction():
+                    conn.execute('CREATE SCHEMA etl_gnr_test')
+                    conn.execute('SET LOCAL search_path TO etl_gnr_test')
+                    db.init(conn)
+
+                    @contextmanager
+                    def scoped_connect(**kwargs):
+                        try:
+                            yield conn
+                        finally:
+                            conn.execute('SELECT pg_advisory_unlock(%s)', (db.RUN_LOCK_KEY,))
+
+                    def execute():
+                        source = Source()
+                        with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
+                             mock.patch.object(cli, 'Source', return_value=source), \
+                             mock.patch.object(gnr, 'FIRST_DATE', today - timedelta(days=5)), \
+                             mock.patch('sys.argv', ['etl', '--gnr', '--reports', '--overlap-days', '1']), mock.patch('builtins.print'):
+                            self.assertEqual(cli.main(), 0)
+                        return source
+
+                    source = execute()
+                    self.assertEqual((source.days[0], len(source.pages)), ((today - timedelta(days=5)).isoformat(), 26))
+                    self.assertEqual(conn.execute("SELECT name, address FROM facilities WHERE source_id='gnr:P25'").fetchone(),
+                                     ('Place 25', '1 Main St\r\nLilburn, GA 30047'))
+                    self.assertEqual(conn.execute("SELECT facility_id, inspection_date::text, score, grade, time_in::text, observations FROM gnr_inspections WHERE source_id='I0'").fetchone(),
+                                     ('gnr:P0', day, 90, 'A', '11:05:00', ['4-2B: Mold & dirt\nCorrective Actions: Cleaned', '13A: Not posted']))
+                    state_run = db.start(conn, {'start_page': 0})
+                    self.assertIsNone(db.cutoff(conn, state_run, dict(start_page=0, full=False, overlap_days=14)))
+                    rows[0]['score'] = 80
+                    source = execute()
+                    self.assertEqual((source.days[0], source.pages), ((today - timedelta(days=3)).isoformat(), [
+                        'https://inspections.myhealthdepartment.com/gwinnett-ga/inspection/?inspectionID=I0']))
                     raise Rollback()
             except Rollback:
                 pass

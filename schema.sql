@@ -17,6 +17,12 @@ CREATE TABLE IF NOT EXISTS violations (
  PRIMARY KEY (facility_id, inspection_id, snapshot_hash, source_key),
  FOREIGN KEY (facility_id, inspection_id) REFERENCES inspections(facility_id, source_id)
 );
+CREATE TABLE IF NOT EXISTS gnr_inspections (
+ source_id text PRIMARY KEY, facility_id text NOT NULL REFERENCES facilities(source_id),
+ inspection_date date NOT NULL, inspection_type text, purpose text, score numeric, grade text, time_in time,
+ comments text, observations jsonb, raw jsonb NOT NULL, detail_fetched_at timestamptz, detail_error text
+);
+CREATE INDEX IF NOT EXISTS gnr_inspections_facility_id ON gnr_inspections (facility_id);
 CREATE OR REPLACE VIEW current_violations AS
  SELECT v.* FROM violations v JOIN inspections i
  ON v.facility_id = i.facility_id AND v.inspection_id = i.source_id

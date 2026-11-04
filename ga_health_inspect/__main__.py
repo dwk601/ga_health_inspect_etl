@@ -5,7 +5,7 @@ import sys
 
 import psycopg
 
-from . import db, pipeline
+from . import db, gnr, pipeline
 from .source import Source
 
 
@@ -33,10 +33,13 @@ def main():
     parser.add_argument('--reports', action='store_true')
     parser.add_argument('--retry-report-errors', action='store_true')
     parser.add_argument('--max-reports', type=positive)
+    parser.add_argument('--gnr', action='store_true', help='Load Gwinnett/Newton/Rockdale from the GNR Public Health site')
     args = parser.parse_args()
+    if args.gnr and (args.retry_report_errors or args.start_page is not None or args.max_pages is not None):
+        parser.error('--gnr cannot be combined with --retry-report-errors, --start-page or --max-pages')
     if args.retry_report_errors and (args.reports or args.full or args.start_page is not None or args.max_pages is not None):
         parser.error('--retry-report-errors cannot be combined with --reports, --full, --start-page or --max-pages')
-    if args.start_page is None:
+    if args.start_page is None and not args.gnr:
         args.start_page = 0
     if args.max_reports is not None and not (args.reports or args.retry_report_errors):
         parser.error('--max-reports requires --reports or --retry-report-errors')
@@ -50,7 +53,7 @@ def main():
         run_id = db.start(conn, vars(args))
         try:
             with Source() as source:
-                status = pipeline.run(conn, source, run_id, vars(args))
+                status = (gnr.run if args.gnr else pipeline.run)(conn, source, run_id, vars(args))
             db.finish(conn, run_id, status)
             return 0
         except KeyboardInterrupt:

@@ -34,12 +34,26 @@ class Source:
         return self.session_manager.__exit__(exc_type, exc_value, traceback)
 
     def get(self, url):
+        return self.request('get', url)
+
+    def post_json(self, url, body):
+        response = self.request('post', url, json=body)
+        try:
+            data = json.loads(response.body)
+        except ValueError as exc:
+            raise RuntimeError(f'Invalid API response for {url}: {exc}') from exc
+        if not isinstance(data, list):
+            raise RuntimeError(f'Unexpected API response for {url}: {response.body[:200]!r}')
+        return data
+
+    def request(self, method, url, **kwargs):
         for attempt in range(3):
             # Space request starts 0.5s apart: at most 2 requests/second, without idling after slow responses.
             time.sleep(max(0, 0.5 - (time.monotonic() - self.last_request)))
             self.last_request = time.monotonic()
             try:
-                response = self.session.get(url, timeout=30, retries=1, follow_redirects=False, discard_cookies=True)
+                response = getattr(self.session, method)(url, timeout=30, retries=1, follow_redirects=False,
+                                                         discard_cookies=True, **kwargs)
                 if response.status == 429 or response.status >= 500:
                     raise RuntimeError(f'HTTP {response.status} for {url}')
                 if response.status != 200:
