@@ -22,8 +22,10 @@ FIRST_DATE = date(2024, 10, 1)  # The site returns nothing earlier.
 PAGE_SIZE = 25
 MAX_START = 200
 FACILITY_PREFIX = 'gnr:'
-# The site's load balancer blocks an IP (403 on every request for ~6 minutes) after roughly 200 requests in 5 minutes.
+# The site's load balancer blocks an IP (403 on every request for ~6 minutes) after roughly 200 search
+# requests or 100 inspection page requests in 5 minutes.
 REQUEST_INTERVAL = 3
+DETAIL_REQUEST_INTERVAL = 6
 REQUIRED_FIELDS = ('permitID', 'inspectionID', 'inspectionDate', 'establishmentName')
 
 
@@ -40,6 +42,7 @@ def run(conn, source, run_id, options):
             add_counters(conn, run_id, facilities=len({row['permitID'] for row in rows}), inspections=len(rows))
         day += timedelta(days=1)
     if options['reports']:
+        source.request_interval = DETAIL_REQUEST_INTERVAL
         fetch_details(conn, source, run_id, options['max_reports'])
     return 'exhausted' if options['full'] else 'caught_up'
 
