@@ -309,7 +309,7 @@ class LifecycleTest(unittest.TestCase):
                  'establishmentName': f'Place {i} ', 'addressLine1': '1 Main St', 'addressLine2': '', 'city': 'Lilburn',
                  'state': 'GA', 'zip': '30047', 'score': 90, 'scoreDisplay': 'A', 'timein': '1899-12-30T11:05:00.000Z'}
                 for i in range(26)]
-        blocked = False
+        blocks = [0]
         page = b'''<h3 class="observations-header">Observations &amp; Corrective Actions</h3><p class="observations-text">
             4-2B: Mold &amp; dirt<br />Corrective Actions: Cleaned<br /><br />13A: Not posted<br /><br /></p>'''
 
@@ -332,7 +332,8 @@ class LifecycleTest(unittest.TestCase):
 
             def get(self, url):
                 self.pages.append(url)
-                if blocked:
+                if blocks[0]:
+                    blocks[0] -= 1
                     raise HTTPError(403, url)
                 return SimpleNamespace(body=page)
 
@@ -356,7 +357,7 @@ class LifecycleTest(unittest.TestCase):
                              mock.patch.object(cli, 'Source', return_value=source), \
                              mock.patch.object(gnr, 'FIRST_DATE', today - timedelta(days=5)), \
                              mock.patch('sys.argv', ['etl', '--gnr', '--reports', '--overlap-days', '1']), mock.patch('builtins.print'), \
-                             mock.patch('sys.stderr'):
+                             mock.patch('sys.stderr'), mock.patch.object(gnr.time, 'sleep'):
                             self.assertEqual(cli.main(), exit_code)
                         return source
 
@@ -369,12 +370,13 @@ class LifecycleTest(unittest.TestCase):
                     state_run = db.start(conn, {'start_page': 0})
                     self.assertIsNone(db.cutoff(conn, state_run, dict(start_page=0, full=False, overlap_days=14)))
                     rows[0]['score'] = 80
+                    blocks[0] = 1
                     source = execute()
                     self.assertEqual((source.days[0], source.pages), ((today - timedelta(days=3)).isoformat(), [
-                        'https://inspections.myhealthdepartment.com/gwinnett-ga/inspection/?inspectionID=I0']))
+                        'https://inspections.myhealthdepartment.com/gwinnett-ga/inspection/?inspectionID=I0'] * 2))
                     rows[0]['score'] = 70
-                    blocked = True
-                    self.assertEqual(len(execute(exit_code=1).pages), 1)
+                    blocks[0] = 99
+                    self.assertEqual(len(execute(exit_code=1).pages), 3)
                     self.assertEqual(conn.execute("SELECT detail_fetched_at, detail_error FROM gnr_inspections WHERE source_id='I0'").fetchone(), (None, None))
                     raise Rollback()
             except Rollback:

@@ -24,8 +24,9 @@ class HTTPError(RuntimeError):
 
 
 class Source:
-    def __init__(self, request_interval=0.5):
+    def __init__(self, request_interval=0.5, keep_cookies=False):
         self.request_interval = request_interval
+        self.keep_cookies = keep_cookies
         self.last_request = 0.0
         self.session_manager = FetcherSession()
 
@@ -56,7 +57,7 @@ class Source:
             self.last_request = time.monotonic()
             try:
                 response = getattr(self.session, method)(url, timeout=30, retries=1, follow_redirects=False,
-                                                         discard_cookies=True, **kwargs)
+                                                         discard_cookies=not self.keep_cookies, **kwargs)
                 if response.status == 429 or response.status >= 500:
                     raise RuntimeError(f'HTTP {response.status} for {url}')
                 if response.status != 200:

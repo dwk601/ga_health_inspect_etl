@@ -3,6 +3,7 @@ import html
 import json
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -22,10 +23,11 @@ FIRST_DATE = date(2024, 10, 1)  # The site returns nothing earlier.
 PAGE_SIZE = 25
 MAX_START = 200
 FACILITY_PREFIX = 'gnr:'
-# The site's load balancer blocks an IP (403 on every request for ~6 minutes) after roughly 200 search
-# requests or 100 inspection page requests in 5 minutes.
+# The site's load balancer blocks an IP (403 on every request for ~6 minutes) after bursts of roughly 200 search
+# requests or 100 inspection page requests in 5 minutes, and still occasionally after hundreds of pages at 6s spacing.
 REQUEST_INTERVAL = 3
 DETAIL_REQUEST_INTERVAL = 6
+BLOCK_RETRY_DELAYS = (600, 1200)
 REQUIRED_FIELDS = ('permitID', 'inspectionID', 'inspectionDate', 'establishmentName')
 
 
@@ -105,7 +107,7 @@ def fetch_details(conn, source, run_id, limit):
     for (inspection_id,) in pending:
         url = f'{SITE}{JURISDICTION}/inspection/?inspectionID={quote(inspection_id)}'
         try:
-            items, error = observations(source.get(url).body), None
+            items, error = observations(get_unblocked(source, url).body), None
         except Exception as exc:
             if isinstance(exc, HTTPError) and exc.status == 403:  # Blocked: every further request would fail too.
                 raise
@@ -116,6 +118,18 @@ def fetch_details(conn, source, run_id, limit):
                 detail_fetched_at=now() WHERE source_id=%s''', (None if items is None else Jsonb(items), error, inspection_id))
             conn.execute('UPDATE etl_runs SET report_errors=report_errors+%s WHERE id=%s', (int(error is not None), run_id))
             add_counters(conn, run_id, parsed_reports=int(error is None))
+
+
+def get_unblocked(source, url):
+    for delay in BLOCK_RETRY_DELAYS:
+        try:
+            return source.get(url)
+        except HTTPError as exc:
+            if exc.status != 403:
+                raise
+            print(f'GNR blocked us; retrying in {delay}s', file=sys.stderr, flush=True)
+            time.sleep(delay)
+    return source.get(url)
 
 
 def observations(body):
