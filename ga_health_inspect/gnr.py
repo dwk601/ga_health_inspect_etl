@@ -11,6 +11,7 @@ from psycopg.types.json import Jsonb
 from scrapling.parser import Selector
 
 from . import db
+from .source import HTTPError
 
 SITE = 'https://inspections.myhealthdepartment.com/'
 JURISDICTION = 'gwinnett-ga'
@@ -21,8 +22,8 @@ FIRST_DATE = date(2024, 10, 1)  # The site returns nothing earlier.
 PAGE_SIZE = 25
 MAX_START = 200
 FACILITY_PREFIX = 'gnr:'
-# The site's load balancer returned 403 to every request after ~700 requests in 5 minutes at 2/second.
-REQUEST_INTERVAL = 1.5
+# The site's load balancer blocks an IP (403 on every request for ~6 minutes) after roughly 200 requests in 5 minutes.
+REQUEST_INTERVAL = 3
 REQUIRED_FIELDS = ('permitID', 'inspectionID', 'inspectionDate', 'establishmentName')
 
 
@@ -103,6 +104,8 @@ def fetch_details(conn, source, run_id, limit):
         try:
             items, error = observations(source.get(url).body), None
         except Exception as exc:
+            if isinstance(exc, HTTPError) and exc.status == 403:  # Blocked: every further request would fail too.
+                raise
             print(f'GNR inspection page failed for {url}: {exc}', file=sys.stderr, flush=True)
             items, error = None, f'{type(exc).__name__}: {exc}'
         with conn.transaction():

@@ -18,7 +18,9 @@ UNCLOSED_SCRIPT = re.compile(rb'<script>(?=[^<]*</div>)')
 
 
 class HTTPError(RuntimeError):
-    pass
+    def __init__(self, status, url):
+        super().__init__(f'HTTP {status} for {url}')
+        self.status = status
 
 
 class Source:
@@ -58,7 +60,7 @@ class Source:
                 if response.status == 429 or response.status >= 500:
                     raise RuntimeError(f'HTTP {response.status} for {url}')
                 if response.status != 200:
-                    raise HTTPError(f'HTTP {response.status} for {url}')
+                    raise HTTPError(response.status, url)
                 return response
             except HTTPError:
                 raise

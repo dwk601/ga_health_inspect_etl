@@ -13,7 +13,7 @@ from scrapling.parser import Selector
 from ga_health_inspect import db, gnr, pipeline, transform
 from ga_health_inspect import __main__ as cli
 from ga_health_inspect.pipeline import fetch_page, ingest_page
-from ga_health_inspect.source import Source
+from ga_health_inspect.source import HTTPError, Source
 
 FACILITY = {'id': 'YWJj', 'name': 'Example', 'mapAddress': '1 Main St', 'columns': {
     '0': '1 Main St', '1': 'Phone Number: 123', '2': 'Permit Type: Food Service',
@@ -309,6 +309,7 @@ class LifecycleTest(unittest.TestCase):
                  'establishmentName': f'Place {i} ', 'addressLine1': '1 Main St', 'addressLine2': '', 'city': 'Lilburn',
                  'state': 'GA', 'zip': '30047', 'score': 90, 'scoreDisplay': 'A', 'timein': '1899-12-30T11:05:00.000Z'}
                 for i in range(26)]
+        blocked = False
         page = b'''<h3 class="observations-header">Observations &amp; Corrective Actions</h3><p class="observations-text">
             4-2B: Mold &amp; dirt<br />Corrective Actions: Cleaned<br /><br />13A: Not posted<br /><br /></p>'''
 
@@ -331,6 +332,8 @@ class LifecycleTest(unittest.TestCase):
 
             def get(self, url):
                 self.pages.append(url)
+                if blocked:
+                    raise HTTPError(403, url)
                 return SimpleNamespace(body=page)
 
         with psycopg.connect(autocommit=True) as conn:
@@ -347,13 +350,14 @@ class LifecycleTest(unittest.TestCase):
                         finally:
                             conn.execute('SELECT pg_advisory_unlock(%s)', (db.RUN_LOCK_KEY,))
 
-                    def execute():
+                    def execute(exit_code=0):
                         source = Source()
                         with mock.patch.object(cli.psycopg, 'connect', side_effect=scoped_connect), \
                              mock.patch.object(cli, 'Source', return_value=source), \
                              mock.patch.object(gnr, 'FIRST_DATE', today - timedelta(days=5)), \
-                             mock.patch('sys.argv', ['etl', '--gnr', '--reports', '--overlap-days', '1']), mock.patch('builtins.print'):
-                            self.assertEqual(cli.main(), 0)
+                             mock.patch('sys.argv', ['etl', '--gnr', '--reports', '--overlap-days', '1']), mock.patch('builtins.print'), \
+                             mock.patch('sys.stderr'):
+                            self.assertEqual(cli.main(), exit_code)
                         return source
 
                     source = execute()
@@ -368,6 +372,10 @@ class LifecycleTest(unittest.TestCase):
                     source = execute()
                     self.assertEqual((source.days[0], source.pages), ((today - timedelta(days=3)).isoformat(), [
                         'https://inspections.myhealthdepartment.com/gwinnett-ga/inspection/?inspectionID=I0']))
+                    rows[0]['score'] = 70
+                    blocked = True
+                    self.assertEqual(len(execute(exit_code=1).pages), 1)
+                    self.assertEqual(conn.execute("SELECT detail_fetched_at, detail_error FROM gnr_inspections WHERE source_id='I0'").fetchone(), (None, None))
                     raise Rollback()
             except Rollback:
                 pass
